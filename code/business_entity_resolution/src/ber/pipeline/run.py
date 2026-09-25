@@ -65,23 +65,40 @@ def run_stage(cfg, stage: str, args) -> dict | None:
         for s in _splits(args):
             biencoder.hits(cfg, s)
     elif stage == "block":
+        import gc
+
         import polars as pl
 
-        from ..blocking.candidates import block_split, scan_union
-        from ..eval.metric import ceiling
+        from ..blocking.candidates import block_split, union_files
+        from ..eval.metric import macro_f05
         info = {}
         for s in _splits(args):
             info[s] = block_split(cfg, s)
             if s == "train":
-                union = scan_union(cfg, "train", ["s1_uid", "rec_uid"]).collect()
+                # Stream per-country file to avoid loading all 179M union pairs at once (OOM on 34 GB).
+                # Only accumulate the *hits* (pairs that match truth), which are << total union size.
                 truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet"))
                 s1 = pl.read_parquet(work_dir(cfg, "train", "s1.parquet"))
-                hit = union.join(truth, on=["s1_uid", "rec_uid"]).height
-                info["train_summary"] = {"union_ceiling": ceiling(union, truth, s1),
-                                         "pair_recall": hit / max(1, truth.height),
-                                         "pairs_per_s1": union.height / s1.height}
+                total_pairs = 0
+                all_hits = []
+                for uf in union_files(cfg, "train"):
+                    chunk = pl.scan_parquet(str(uf)).select(["s1_uid", "rec_uid"]).collect()
+                    total_pairs += chunk.height
+                    hits = chunk.join(truth, on=["s1_uid", "rec_uid"])
+                    if hits.height > 0:
+                        all_hits.append(hits)
+                    del chunk, hits
+                    gc.collect()
+                # The accumulated hits are ~truth-sized (a few million), not union-sized (179M).
+                hit_df = pl.concat(all_hits) if all_hits else pl.DataFrame({"s1_uid": [], "rec_uid": []})
+                del all_hits
+                ceil_val = macro_f05(hit_df, truth, s1)
+                info["train_summary"] = {"union_ceiling": ceil_val,
+                                         "pair_recall": hit_df.height / max(1, truth.height),
+                                         "pairs_per_s1": total_pairs / s1.height}
                 log().info("  train union: %s", info["train_summary"])
-                del union
+                del truth, s1, hit_df
+                gc.collect()
         return info
     elif stage == "prerank":
         import shutil

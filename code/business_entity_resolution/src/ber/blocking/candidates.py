@@ -179,22 +179,42 @@ def block_split(cfg, split: str) -> dict:
         gc.collect()
         A, C = _vectors_from_docs(addr_docs, name_docs, vdir, cfg, workers)
         del addr_docs, name_docs
-        if bc.get("save_vectors", True):  # only 2-hop expansion and the S1<->S1 diagnostic need them later
-            np.save(vdir / "uids.npy", uids)
-            np.save(vdir / "addr_rp.npy", A)
-            np.save(vdir / "comb_rp.npy", C)
+        gc.collect()
+
+        # Save vectors to disk first, so we can free the in-memory copies after kNN
+        # and reload them as memory-mapped arrays for rowwise_cos (uses disk I/O instead of RAM).
+        np.save(vdir / "uids.npy", uids)
+        np.save(vdir / "addr_rp.npy", A)
+        np.save(vdir / "comb_rp.npy", C)
 
         s1_all, rec_all = np.where(src == 1)[0], np.where(src != 1)[0]
         s1_a, rec_a = np.where((src == 1) & has_addr)[0], np.where((src != 1) & has_addr)[0]
+
+        # ── kNN phase: run all channels, then immediately free the vectors from RAM ──
         hits = []
         hits += _knn_both(A, s1_a, rec_a, uids, int(bc.a1.k_fwd), int(bc.a1.k_rev), float(bc.a1.min_score), "a1", cfg)
+        del A  # free address vectors (~2.9 GB for US) before the combined kNN
+        gc.collect()
         hits += _knn_both(C, s1_all, rec_all, uids, int(bc.n1.k_fwd), int(bc.n1.k_rev), float(bc.n1.min_score),
                           "n1", cfg)
+        del C  # free combined vectors (~5.8 GB for US) before aggregation
+        gc.collect()
+        # Free GPU memory after all kNN searches are done
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
         dense_path = work_dir(cfg, split, "cands", f"dense_hits_{safe(country)}.parquet")
         if bc.get("dense", {}).get("enabled", False) and dense_path.exists():
             hits.append(pl.read_parquet(dense_path))
+
+        # ── Aggregate kNN hits immediately and free the raw hit DataFrames ──
         knn = pl.concat(hits)
         del hits
+        gc.collect()
         aggs = []
         for name, code in CHANNELS.items():
             aggs.append(pl.col("rank").filter(pl.col("ch") == code).min().alias(f"{name}_rank"))
@@ -205,12 +225,16 @@ def block_split(cfg, split: str) -> dict:
         union = knn.join(kagg, on=["s1_uid", "rec_uid"], how="full", coalesce=True)
         del knn, kagg
         gc.collect()
+
+        # ── Cosine phase: reload vectors via mmap (disk I/O, not RAM) ──
+        A_mm = np.load(vdir / "addr_rp.npy", mmap_mode="r")
+        C_mm = np.load(vdir / "comb_rp.npy", mmap_mode="r")
         pos_s = np.searchsorted(uids, union["s1_uid"].to_numpy())
         pos_r = np.searchsorted(uids, union["rec_uid"].to_numpy())
-        a1 = rowwise_cos(A, A, pos_s, pos_r)
+        a1 = rowwise_cos(A_mm, A_mm, pos_s, pos_r)
         a1[~(has_addr[pos_s] & has_addr[pos_r])] = np.nan
-        n1 = rowwise_cos(C, C, pos_s, pos_r)
-        del A, C, pos_s, pos_r
+        n1 = rowwise_cos(C_mm, C_mm, pos_s, pos_r)
+        del A_mm, C_mm, pos_s, pos_r
         union = union.with_columns([pl.Series("a1_cos", a1), pl.Series("n1_cos", n1), pl.lit(country).alias("country")])
         del a1, n1
         log().info("  [%s/%s] union pairs: %d (%.1f per S1)", split, country, union.height,
