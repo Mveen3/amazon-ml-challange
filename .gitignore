@@ -24,3 +24,4 @@ __pycache__/
 
 # Restricted
 .hidden/
+dataset.zip
