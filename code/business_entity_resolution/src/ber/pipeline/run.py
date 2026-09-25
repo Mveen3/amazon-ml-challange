@@ -218,8 +218,28 @@ def main(argv=None) -> None:
             log().info("⏭  %s already done (use --force to re-run)", st)
             continue
         t0 = time.time()
-        with timer(f"stage {st}"):
-            info = run_stage(cfg, st, args)
+        try:
+            with timer(f"stage {st}"):
+                info = run_stage(cfg, st, args)
+        except Exception as exc:
+            # ── crash recovery: pull whatever was last pushed to HF and retry once ──
+            log().warning("  stage %s failed (%s: %s); attempting HF crash recovery …",
+                          st, type(exc).__name__, str(exc).splitlines()[0][:200])
+            try:
+                from ..checkpoint import force_restore_now
+                force_restore_now()
+            except Exception as re_exc:
+                log().warning("  crash recovery download failed (%s); re-raising original error", re_exc)
+                raise exc from None
+            # If the stage is now done (sub-stage progress covered everything), skip the retry
+            if stage_done(cfg, st, marker_split):
+                log().info("  crash recovery: stage %s is now complete after restore — no retry needed", st)
+                info = None
+            else:
+                log().info("  crash recovery: retrying stage %s with restored sub-stage progress …", st)
+                t0 = time.time()
+                with timer(f"stage {st} (retry)"):
+                    info = run_stage(cfg, st, args)
         mark_done(cfg, st, marker_split, {"seconds": round(time.time() - t0, 1), "info": info})
         ckpt.sync(f"stage {st} done")  # outputs + completion marker in one commit
         show_progress()

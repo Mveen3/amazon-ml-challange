@@ -136,6 +136,21 @@ class Checkpointer:
         markers = self.work / "_markers"
         if markers.exists() and any(markers.iterdir()):
             return  # this session already has local progress
+        self._download_from_hf()
+
+    def force_restore(self) -> None:
+        """Re-download from HF even when local markers exist (crash recovery).
+
+        This overwrites the local work dir with whatever is on HF, recovering
+        any sub-stage progress that was pushed before the crash.
+        """
+        if not self.enabled:
+            return
+        log().info("  checkpoint: crash recovery — re-downloading latest HF state")
+        self._download_from_hf()
+
+    def _download_from_hf(self) -> None:
+        """Download the remote checkpoint into the local work dir."""
         remote = self._remote_files()
         if not remote:
             log().info("  checkpoint: nothing saved yet -> starting from scratch")
@@ -157,6 +172,7 @@ class Checkpointer:
                 n, size = n + 1, size + dst.stat().st_size
         shutil.rmtree(stage, ignore_errors=True)
         self._write_manifest(self._scan())
+        markers = self.work / "_markers"
         done = sorted(p.name.split(".")[0] for p in markers.glob("*.done")) if markers.exists() else []
         log().info("  checkpoint: restored %d files (%.2f GB) in %.0fs; finished stages: %s", n, size / 1e9,
                    time.time() - t0, ", ".join(done) or "none")
@@ -198,3 +214,14 @@ def sync_now(message: str) -> None:
     """Mid-stage checkpoint (e.g. after each cross-encoder half); no-op when checkpointing is off."""
     if _ACTIVE is not None:
         _ACTIVE.sync(message)
+
+
+def force_restore_now() -> None:
+    """Re-download the latest HF checkpoint even when local markers already exist.
+
+    Called after a crash (exit -9 / OOM) to recover whatever was last pushed.
+    The local work dir may contain a mix of stale and fresh files, so we
+    download the HF state on top, letting it overwrite anything already present.
+    """
+    if _ACTIVE is not None:
+        _ACTIVE.force_restore()

@@ -219,7 +219,32 @@ class KaggleRun:
                 self.status(sets, activity=True)
                 next_beat = time.time() + self.heartbeat_s
 
-    def run(self, stages: str, sets: list[str], log_name: str = "pipeline.log", fresh: bool = False) -> None:
+    def _hf_crash_restore(self, sets: list[str]) -> bool:
+        """After a SIGKILL (OOM), re-download whatever was last pushed to HF.
+
+        Returns True if the restore succeeded, False otherwise.
+        """
+        if not self.use_ckpt:
+            return False
+        print("\n⚠ Process killed (likely OOM) — attempting HF crash recovery …")
+        restore_script = (
+            "from ber.config import load_config; "
+            "from ber.checkpoint import activate; "
+            f"cfg = load_config({self.config!r}, {sets!r}); "
+            "ckpt = activate(cfg); "
+            "ckpt.force_restore()"
+        )
+        r = subprocess.run([sys.executable, "-c", restore_script], cwd=self.pkg, env=self._env(),
+                           text=True, capture_output=True, timeout=600)
+        print((r.stdout + r.stderr).strip()[-3000:])
+        if r.returncode == 0:
+            print("✔ HF crash recovery successful — sub-stage progress restored.")
+            return True
+        print("✘ HF crash recovery failed; the next run will still use the last checkpoint.")
+        return False
+
+    def run(self, stages: str, sets: list[str], log_name: str = "pipeline.log", fresh: bool = False,
+            _retry: bool = False) -> None:
         cmd = [sys.executable, "-u", "-m", "ber.pipeline.run", "--config", self.config, "--stage", stages]
         for s in sets:
             cmd += ["--set", s]
@@ -246,6 +271,11 @@ class KaggleRun:
         print(f"\n[{stages}] exit {p.returncode} in {(time.time() - t0) / 60:.1f} min | session time used: {self._hours()}")
         self.status(sets)
         if p.returncode != 0:
+            # ── OOM crash recovery: exit -9 (SIGKILL) is the classic OOM killer signal ──
+            if p.returncode in (-9, -6, 137) and not _retry:
+                if self._hf_crash_restore(sets):
+                    print(f"\n↻ Retrying stage(s) '{stages}' with restored sub-stage progress …\n")
+                    return self.run(stages, sets, log_name=log_name, fresh=False, _retry=True)
             raise RuntimeError(f"stage(s) '{stages}' failed - see the log above ({self.logs / log_name}). "
                                "Re-running this cell resumes at the failed stage.")
 
@@ -253,6 +283,7 @@ class KaggleRun:
         """One group of full-run stages (finished stages are skipped, also after a checkpoint restore)."""
         fresh, self.fresh_pending = self.fresh_pending, False
         self.run(stages, self._sets() + self.overrides, fresh=fresh)
+
 
     def smoke(self) -> None:
         """Rehearse the full run (same config, same code) on a 5k-entity sample; with HF checkpoints on, also

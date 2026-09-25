@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import gc
 import re
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -136,12 +135,30 @@ def block_split(cfg, split: str) -> dict:
     bc = cfg.blocking
     workers = n_workers(cfg)
     udir = union_dir(cfg, split)
-    if udir.exists():
-        shutil.rmtree(udir)
+    # Don't rmtree the union dir: a prior sub-stage checkpoint may have written
+    # some country parquets that should be skipped on resume.
     ensure_dir(udir)
     info = {}
     bits = {i: 1 << i for i in range(len(K.KEY_TYPES))}
     for country in countries(cfg, split):
+        country_file = udir / f"{safe(country)}.parquet"
+        # ── sub-stage resume: skip countries that already have a union file ──
+        if country_file.exists():
+            try:
+                existing = pl.read_parquet(country_file)
+                part = load_country(cfg, split, country)
+                n_s1 = int((part["src"].to_numpy() == 1).sum())
+                info[country] = {"pairs": existing.height, "s1": n_s1,
+                                 "pairs_per_s1": existing.height / max(1, n_s1)}
+                log().info("  [%s/%s] already done (%d pairs, %.1f per S1) — skipping",
+                           split, country, existing.height, existing.height / max(1, n_s1))
+                del existing, part
+                gc.collect()
+                continue
+            except Exception:
+                log().info("  [%s/%s] existing file unreadable — rebuilding", split, country)
+                country_file.unlink(missing_ok=True)
+
         # Memory order matters at full scale: the exact-key pairs are computed and aggregated while the
         # partition is the only big object; the partition is dropped before the vectors are built; the
         # kNN / key tables are dropped before the RP cosines. Peak = max of these phases, not their sum.
@@ -198,8 +215,14 @@ def block_split(cfg, split: str) -> dict:
         del a1, n1
         log().info("  [%s/%s] union pairs: %d (%.1f per S1)", split, country, union.height,
                    union.height / max(1, len(s1_all)))
-        union.sort(["s1_uid", "rec_uid"]).write_parquet(udir / f"{safe(country)}.parquet")
+        union.sort(["s1_uid", "rec_uid"]).write_parquet(country_file)
         info[country] = {"pairs": union.height, "s1": int(len(s1_all)), "pairs_per_s1": union.height / max(1, len(s1_all))}
         del union
         gc.collect()
+
+        # ── sub-stage checkpoint: push this country's union file to HF ──
+        # If the next country OOMs, a re-run will restore from HF and skip this one.
+        from ..checkpoint import sync_now
+        sync_now(f"block {split}/{country} done ({info[country]['pairs']} pairs)")
+
     return info
