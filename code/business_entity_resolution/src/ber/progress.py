@@ -27,9 +27,9 @@ TRAIN_ONLY = {"eda", "mine", "ce_train", "tune"}
 # measured Kaggle log (a Kaggle core is ~4x slower than a laptop core on this Python-heavy work): normalize ~17 min
 # (24M records), features ~55 min (~16M pairs at ~0.7 ms/pair/core), block and prerank dominated by 100M+-pair GPU
 # kNN and rapidfuzz scoring, XGBoost stages ~30-40 min each.
-MINUTES = {"ingest": 3, "eda": 1, "mine": 8, "normalize": 17, "dense": 30, "block": 85, "prerank": 75, "expand": 15,
-           "features": 55, "r1": 30, "ce_train": 30, "ce_infer": 45, "r2": 40, "gate": 5, "tune": 10, "predict": 3,
-           "outputs": 8}
+MINUTES = {"ingest": 3, "eda": 1, "mine": 8, "normalize": 17, "dense": 30, "block": 65, "prerank": 70, "expand": 15,
+           "features": 55, "r1": 24, "ce_train": 24, "ce_infer": 36, "r2": 32, "gate": 4, "tune": 10, "predict": 3,
+           "outputs": 8}  # block/GBDT/CE assume both GPUs are used (search shared, fold models and CE halves in parallel)
 
 
 def plan(ce_enabled: bool = True, expand_enabled: bool = True, dense_enabled: bool = False,

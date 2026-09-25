@@ -17,7 +17,7 @@ import numpy as np
 import polars as pl
 
 from ..features.pair import load_r1
-from ..utils import chunks, ensure_dir, log, torch_device, work_dir
+from ..utils import chunks, ensure_dir, gpu_cap, log, torch_device, work_dir
 
 # Model loading in recent transformers prints two progress lines per weight tensor; that floods logs
 # (and notebook output) for no information. Must be set before transformers is imported.
@@ -103,8 +103,11 @@ def _load_model(name_or_path: str, device):
             return self.m(**enc).logits
 
     net = _Logits(hf_model)
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
-        net = torch.nn.DataParallel(net)
+    n = torch.cuda.device_count() if device.type == "cuda" else 0
+    if gpu_cap() > 0:
+        n = min(n, gpu_cap())
+    if n > 1:
+        net = torch.nn.DataParallel(net, device_ids=list(range(n)))
     return tok, net, hf_model
 
 
@@ -220,6 +223,43 @@ def infer(cfg, split: str, shard: int = 0, nshards: int = 1) -> None:
     out = ensure_dir(work_dir(cfg, split, "preds"))
     df.select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(out / f"ce_part{shard:03d}.parquet")
     log().info("  CE %s shard %d/%d: scored %d pairs", split, shard, nshards, len(ce))
+
+
+def infer_half(cfg, split: str, half: int) -> Path:
+    """Score this half's share of the band with this half's model only (used by the per-GPU workers).
+
+    Train pairs are scored by the model that never saw their entity (so each pair by exactly one half); test pairs
+    are scored by both halves and averaged later by ``merge_halves``.
+    """
+    df = band(cfg, split)
+    halves = [list(h) for h in cfg.folds.neural_halves]
+    if split == "train":
+        df = df.filter(pl.Series(~np.isin(df["fold"].to_numpy(), halves[half])))
+    txt = text_table(cfg, split)
+    scorer = _Scorer(cfg, work_dir(cfg, None, "models", "ce") / f"half{half}")
+    ce = np.empty(df.height, dtype=np.float32)
+    for s, e in chunks(df.height, int(cfg.ce.get("infer_chunk", 1_000_000))):
+        a, b = _texts(txt, df.slice(s, e - s))
+        ce[s:e] = scorer(a, b)
+        log().info("   CE half %d %s: %d/%d pairs scored", half, split, e, df.height)
+    out = ensure_dir(work_dir(cfg, split, "preds")) / f"ce_half{half}.parquet"
+    df.select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(out)
+    return out
+
+
+def merge_halves(cfg, split: str) -> None:
+    """Combine the per-half scores into ``ce_part000.parquet`` (train: disjoint union; test: mean of the two)."""
+    pdir = work_dir(cfg, split, "preds")
+    parts = [pl.read_parquet(pdir / f"ce_half{h}.parquet") for h in (0, 1)]
+    both = pl.concat(parts)
+    merged = both if split == "train" else both.group_by(["s1_uid", "rec_uid"]).agg(pl.col("ce").mean())
+    expected = band(cfg, split).height
+    if merged.height != expected:
+        raise RuntimeError(f"CE {split}: {merged.height} scored pairs but the band has {expected}; check folds.neural_halves")
+    merged.write_parquet(pdir / "ce_part000.parquet")
+    for h in (0, 1):
+        (pdir / f"ce_half{h}.parquet").unlink(missing_ok=True)
+    log().info("  CE %s: merged the two halves -> %d scored pairs", split, merged.height)
 
 
 def load_ce(cfg, split: str) -> pl.DataFrame | None:

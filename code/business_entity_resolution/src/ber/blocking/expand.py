@@ -44,7 +44,8 @@ def _two_hop(pre: pl.DataFrame, cfg, split: str) -> pl.DataFrame:
             continue
         rec_pos = np.where(src_arr[uids] != 1)[0]  # records.parquet row == uid
         q_pos = np.searchsorted(uids, members)
-        idx, sim = topk(C[rec_pos], C[q_pos], int(ec.k) + 1, cfg.blocking.knn.device, float(cfg.blocking.knn.mem_gb))
+        idx, sim = topk(C[rec_pos], C[q_pos], int(ec.k) + 1, cfg.blocking.knn.device,
+                         float(cfg.blocking.knn.mem_gb), max_gpus=int(cfg.blocking.knn.get("max_gpus", 0)))
         k = idx.shape[1]
         nb = pl.DataFrame({"m": np.repeat(members, k), "n": uids[rec_pos[np.clip(idx.ravel(), 0, None)]],
                            "sim": sim.ravel(), "ok": idx.ravel() >= 0})

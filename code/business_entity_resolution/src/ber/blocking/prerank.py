@@ -175,8 +175,9 @@ def _train_prerank(cfg, mdir) -> None:
     tr = _labels(pl.concat(rows, how="diagonal_relaxed"), cfg)
     del rows
     log().info("  pre-ranker training sample: %d pairs of %d entities", tr.height, tr["s1_uid"].n_unique())
-    fit_folds(to_matrix(tr, PRE_FEATURES), tr["label"].to_numpy(), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy(),
-              pc.gbdt, PRE_FEATURES, mdir, seed=int(cfg.run.seed), threads=n_workers(cfg))
+    X, y, fold, ents = to_matrix(tr, PRE_FEATURES), tr["label"].to_numpy(), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()
+    del tr  # the polars table is several GB; folds may train concurrently, each with its own copy of X
+    fit_folds(X, y, fold, ents, pc.gbdt, PRE_FEATURES, mdir, seed=int(cfg.run.seed), threads=n_workers(cfg))
 
 
 def _score_split(cfg, split: str, models) -> None:

@@ -22,7 +22,8 @@ from pathlib import Path
 # sample-scale overrides that let configs/kaggle.yaml (the real full-run config) run on 5k entities
 SMOKE_SETS = ["mining.min_support=3", "blocking.keyblock.admin_df_min=5", "blocking.keyblock.admin_df_max=3000",
               "prerank.chunk_rows=50000", "features.shard_rows=3000", "features.join_rows=10000",
-              "ce.max_pos=3000", "ce.infer_chunk=5000"]
+              "ce.max_pos=3000", "ce.infer_chunk=5000",
+              "blocking.knn.mem_gb=0.002"]  # tiny kNN memory budget -> many small query chunks, so both GPUs get work
 
 
 def q(x) -> str:
@@ -261,7 +262,10 @@ class KaggleRun:
         self.sh(f"cd {q(self.pkg)} && {q(sys.executable)} scripts/make_sample.py --data {q(self.data_dir)} "
                 f"--out {q(sd / 'sample_data')}")
         sets = self._sets(f"{sd}/sample_data", f"{sd}/work", f"{sd}/output") + SMOKE_SETS + ["checkpoint.prefix=smoke-test"]
+        log_file = self.logs / "smoke.log"
+        start = log_file.stat().st_size if log_file.exists() else 0
         self.run("all", sets, log_name="smoke.log", fresh=True)
+        self._check_multi_gpu(log_file.read_text(errors="replace")[start:])
         self.sh(f"cd {q(self.pkg)} && {q(sys.executable)} scripts/score_sample.py --out {q(sd / 'output')} "
                 f"--truth {q(sd / 'sample_data/test_truth.tsv')} --s1 {q(sd / 'sample_data/test/test_source1.tsv')}")
         if not self.use_ckpt:
@@ -282,6 +286,31 @@ class KaggleRun:
         if not same:
             raise RuntimeError("checkpoint round-trip produced different outputs - do not start the full run")
         print("SMOKE TEST PASSED: full pipeline + HF checkpoint save/restore verified (test checkpoint deleted).")
+
+    @staticmethod
+    def gpu_paths_used(text: str) -> dict[str, bool]:
+        """Which multi-GPU paths show up in a pipeline log."""
+        return {"kNN search (block)": bool(re.search(r"knn: .*on cuda:0, cuda:1", text)),
+                "XGBoost folds": bool(re.search(r"fold \d+: fit .* on cuda:1", text)),
+                "cross-encoder (one half per GPU)": "workers running concurrently (GPU 0, 1)" in text}
+
+    def _check_multi_gpu(self, text: str) -> None:
+        try:
+            import torch
+            n = torch.cuda.device_count()
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n < 2:
+            print(f"\nMulti-GPU check skipped: only {n} GPU visible.")
+            return
+        used = self.gpu_paths_used(text)
+        print("\nMulti-GPU paths exercised by the rehearsal:")
+        for name, ok in used.items():
+            print(f"  {'OK     ' if ok else 'NOT USED'}  {name}")
+        if not all(used.values()):
+            print("  -> a path that shows NOT USED either fell back to one GPU (search the log for 'falling back' / "
+                  "'failed') or was skipped. The run still works on one GPU; to make that explicit set "
+                  "EXTRA_OVERRIDES = ['run.max_gpus=1'].")
 
     # ------------------------------------------------------------------ results
     def results(self) -> None:

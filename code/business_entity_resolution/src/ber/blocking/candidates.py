@@ -75,9 +75,9 @@ def _hits(q_uids, i_uids, idx, sim, ch: str, min_score: float, s1_is_query: bool
 def _knn_both(vec, s1_pos, rec_pos, uids, kf, kr, min_score, prefix, cfg) -> list[pl.DataFrame]:
     kc = cfg.blocking.knn
     out = []
-    idx, sim = topk(vec[rec_pos], vec[s1_pos], kf, kc.device, float(kc.mem_gb))
+    idx, sim = topk(vec[rec_pos], vec[s1_pos], kf, kc.device, float(kc.mem_gb), max_gpus=int(kc.get("max_gpus", 0)))
     out.append(_hits(uids[s1_pos], uids[rec_pos], idx, sim, f"{prefix}f", min_score, True))
-    idx, sim = topk(vec[s1_pos], vec[rec_pos], kr, kc.device, float(kc.mem_gb))
+    idx, sim = topk(vec[s1_pos], vec[rec_pos], kr, kc.device, float(kc.mem_gb), max_gpus=int(kc.get("max_gpus", 0)))
     out.append(_hits(uids[rec_pos], uids[s1_pos], idx, sim, f"{prefix}r", min_score, False))
     return out
 

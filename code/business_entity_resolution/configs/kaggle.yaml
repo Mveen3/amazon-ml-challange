@@ -27,7 +27,7 @@ blocking:
   vector_chunk: 100000
   save_vectors: true                 # 2-hop expansion + S1<->S1 diagnostic read them. ~10 GB on the 1.2 TB scratch disk;
                                      # not checkpointed to Hugging Face (rebuilt on demand, see ensure_vectors)
-  knn: {device: auto, mem_gb: 3.0}   # T4: 15 GB, index + query chunks stay well below
+  knn: {device: auto, mem_gb: 3.0, max_gpus: 0}   # T4: 15 GB each; index copied to both GPUs, query chunks shared out
   a1: {k_fwd: 30, k_rev: 3}
   n1: {k_fwd: 20, k_rev: 3}
   # Exact-key blocks: measured on the full US train data, blocks with >50 S1 or >5000 pairs are generic-name

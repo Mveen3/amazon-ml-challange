@@ -114,16 +114,16 @@ def hits(cfg, split: str) -> None:
             for h in (0, 1):
                 E = embs[h]  # model h never saw S1s outside halves[h]
                 s1_pos = np.where((src == 1) & ~np.isin(fold, halves[h]))[0]
-                idx, sim = topk(E[rec_pos], E[s1_pos], int(dc.k_fwd), bc.knn.device, float(bc.knn.mem_gb))
+                idx, sim = topk(E[rec_pos], E[s1_pos], int(dc.k_fwd), bc.knn.device, float(bc.knn.mem_gb), max_gpus=int(bc.knn.get("max_gpus", 0)))
                 out.append(_hits(uids[s1_pos], uids[rec_pos], idx, sim, "d1f", float(dc.min_score), True))
-                idx, sim = topk(E[s1_pos], E[rec_pos], int(dc.k_rev), bc.knn.device, float(bc.knn.mem_gb))
+                idx, sim = topk(E[s1_pos], E[rec_pos], int(dc.k_rev), bc.knn.device, float(bc.knn.mem_gb), max_gpus=int(bc.knn.get("max_gpus", 0)))
                 out.append(_hits(uids[rec_pos], uids[s1_pos], idx, sim, "d1r", float(dc.min_score), False))
         else:
             E = np.hstack(embs) / math.sqrt(2)
             s1_pos = np.where(src == 1)[0]
-            idx, sim = topk(E[rec_pos], E[s1_pos], int(dc.k_fwd), bc.knn.device, float(bc.knn.mem_gb))
+            idx, sim = topk(E[rec_pos], E[s1_pos], int(dc.k_fwd), bc.knn.device, float(bc.knn.mem_gb), max_gpus=int(bc.knn.get("max_gpus", 0)))
             out.append(_hits(uids[s1_pos], uids[rec_pos], idx, sim, "d1f", float(dc.min_score), True))
-            idx, sim = topk(E[s1_pos], E[rec_pos], int(dc.k_rev), bc.knn.device, float(bc.knn.mem_gb))
+            idx, sim = topk(E[s1_pos], E[rec_pos], int(dc.k_rev), bc.knn.device, float(bc.knn.mem_gb), max_gpus=int(bc.knn.get("max_gpus", 0)))
             out.append(_hits(uids[rec_pos], uids[s1_pos], idx, sim, "d1r", float(dc.min_score), False))
         pl.concat(out).write_parquet(ensure_dir(work_dir(cfg, split, "cands")) / f"dense_hits_{safe(country)}.parquet")
         log().info("  dense hits %s/%s written", split, country)

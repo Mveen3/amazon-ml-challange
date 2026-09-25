@@ -47,7 +47,8 @@ def run_s1s1(cfg) -> dict:
             s1_pos = np.where(src == 1)[0]
             rng = np.random.default_rng(int(cfg.run.seed))
             q = rng.choice(s1_pos, min(len(s1_pos), int(cfg.s1s1.queries)), replace=False)
-            idx, sim = topk(C[s1_pos], C[q], 2, cfg.blocking.knn.device, float(cfg.blocking.knn.mem_gb))
+            idx, sim = topk(C[s1_pos], C[q], 2, cfg.blocking.knn.device, float(cfg.blocking.knn.mem_gb),
+                            max_gpus=int(cfg.blocking.knn.get("max_gpus", 0)))
             nb = s1_pos[np.clip(idx[:, 1], 0, None)]  # column 0 is (almost always) the query itself
             pairs = pl.DataFrame({"s1_uid": uids[q], "rec_uid": uids[nb]}).filter(pl.col("s1_uid") != pl.col("rec_uid"))
             pairs = pairs.join(s1p, on="s1_uid").with_columns([pl.lit(country).alias("country"),

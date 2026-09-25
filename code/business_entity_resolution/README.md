@@ -174,6 +174,18 @@ There **is** a difference. Some settings were reduced to fit the time and memory
 - **GBDT:** XGBoost on GPU instead of LightGBM; 4 folds instead of 5; training on 500k entities (400k for the pre-ranker) instead of 800k (600k). On the 5k sample the two setups scored within noise of each other.
 - **Lookup tables** are mined from 1.5M pairs instead of 3M, so a few rare transliteration entries may fall below the support threshold.
 
+### 4.4.2 Using both GPUs
+| Stage | What runs on both GPUs |
+|---|---|
+| `block`, `expand` (nearest-neighbour search) | The index is copied to each GPU and the query chunks are shared out. The result is identical to a single-GPU run (exact top-k, independent chunks). |
+| `prerank`, `r1`, `r2`, `gate` (XGBoost) | The fold models are independent, so two train at once, one per GPU. Saved models are also used for prediction on the GPU. |
+| `ce_train`, `ce_infer` (cross-encoder) | The two cross-fitted halves run as separate processes, one per GPU, instead of PyTorch `DataParallel`. |
+| Everything else (parsing, features, decision layer) | CPU only (4 cores). |
+
+- **Safety:** each path falls back to one GPU (or the sequential path) if a worker fails, for example on out-of-memory. What was tested: correctness of the search and of concurrent training (identical to single-GPU results), the failure fallbacks, and the worker orchestration, using simulated devices. Not tested: real two-GPU behaviour, which the notebook rehearsal checks.
+- **Rehearsal:** it prints `Multi-GPU paths exercised: OK / NOT USED` for the three paths above, from the log.
+- **Kill switch:** `EXTRA_OVERRIDES = ["run.max_gpus=1"]` forces single-GPU behaviour in every stage. Per-stage caps: `blocking.knn.max_gpus`, `<stage>.gbdt.max_gpus`, and `ce.parallel_halves: false`.
+
 ### 4.5 If the 12-hour limit is tight
 Full-scale runtime on Kaggle has **not been measured**. The notebook prints the session time used after every stage. To shorten a run:
 - Set `USE_CROSS_ENCODER = False`. This saves roughly 1–1.5 hours.
@@ -317,6 +329,8 @@ The local layout (`code/business_entity_resolution/`) is the layout the challeng
 | `gbdt_base.backend`, `*.gbdt.device` | `lightgbm` or `xgboost`; XGBoost device `auto`, `cpu` or `cuda` |
 | `ingest.train_s1_frac` | Train on a fraction of the train clusters (time valve; test is never subsampled) |
 | `expand.probe_entities`, `expand.min_gain` | 2-hop: decide on a sample of N train entities (0 = all); required ceiling gain |
+| `run.max_gpus` | Global GPU cap: 0 = use all GPUs (default), 1 = single-GPU everywhere |
+| `ce.parallel_halves` | Cross-encoder halves as one process per GPU (needs >= 2 GPUs) |
 | `run.cleanup` | Delete the candidate-union files after the pre-ranker has used them |
 | `checkpoint.*` | Private Hugging Face checkpointing of the work dir: `enabled`, `repo_id`/`repo_name`, `prefix` (one folder per independent run), `token_env`, `exclude` |
 | `prerank.ceiling_tol` | Allowed best-achievable-score loss when choosing the pre-ranker floor (default 0.0002) |

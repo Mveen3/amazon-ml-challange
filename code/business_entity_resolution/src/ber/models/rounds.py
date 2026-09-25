@@ -30,10 +30,11 @@ def run_r1(cfg) -> None:
         feats = [f for f in R1_FEATURES if f in columns_of(paths)]
         sample = sample_entities(entities(paths), int(cfg.r1.sample_entities), int(cfg.run.seed))
         tr = load_rows(paths, KEYS + ["fold", "label"] + feats, sample)
-        models = fit_folds(to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(),
-                           tr["s1_uid"].to_numpy(), cfg.r1.gbdt, feats, mdir, seed=int(cfg.run.seed),
+        X, y, fold, ents = to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()
+        del tr  # free the polars table before (possibly concurrent) fold training
+        models = fit_folds(X, y, fold, ents, cfg.r1.gbdt, feats, mdir, seed=int(cfg.run.seed),
                            threads=n_workers(cfg), monotone=cfg.r1.get("monotone", []))
-        del tr
+        del X
         pr = predict_shards(paths, models, feats, KEYS + ["fold", "label"])
         save_json(_auc(pr["label"].to_numpy(), pr["pred"].to_numpy(), "r1"), mdir / "oof_metrics.json")
         pr.select(KEYS + ["fold", pl.col("pred").alias("p1")]).write_parquet(
@@ -92,10 +93,11 @@ def _train_r2(cfg, mdir) -> None:
     sample = sample_entities(entities(paths), int(cfg.r2.sample_entities), int(cfg.run.seed) + 100)
     tr = load_rows(paths, KEYS + ["fold", "label"] + feats, sample)
     tr = tr.join(extras.filter(pl.col("s1_uid").is_in(sample.implode())), on=KEYS, how="inner").sort(KEYS)
-    models = fit_folds(to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(),
-                       tr["s1_uid"].to_numpy(), cfg.r2.gbdt, feats, mdir, seed=int(cfg.run.seed) + 100,
+    X, y, fold, ents = to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()
+    del tr  # free the polars table before (possibly concurrent) fold training
+    models = fit_folds(X, y, fold, ents, cfg.r2.gbdt, feats, mdir, seed=int(cfg.run.seed) + 100,
                        threads=n_workers(cfg), monotone=cfg.r2.get("monotone", []))
-    del tr
+    del X
     pr = score_r2(cfg, "train", extras, models)
     y, oof, prof = pr["label"].to_numpy().astype(np.float32), pr["pred"].to_numpy(), pr["prof"].to_numpy()
     save_json(_auc(y, oof, "r2"), mdir / "oof_metrics.json")

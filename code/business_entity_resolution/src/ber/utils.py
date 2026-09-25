@@ -140,6 +140,14 @@ def chunks(n: int, size: int):
         yield s, min(n, s + size)
 
 
+def gpu_cap() -> int:
+    """Global cap on how many GPUs any stage may use (``run.max_gpus`` -> env BER_MAX_GPUS); 0 = use them all."""
+    try:
+        return max(0, int(os.environ.get("BER_MAX_GPUS", "0")))
+    except ValueError:
+        return 0
+
+
 def torch_device(pref: str = "auto"):
     import torch
 

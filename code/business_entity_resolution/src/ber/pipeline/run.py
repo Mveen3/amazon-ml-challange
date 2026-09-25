@@ -13,7 +13,9 @@ so the pipeline resumes where it stopped; ``--force`` re-runs completed stages.
 from __future__ import annotations
 
 import argparse
+import os
 import time
+from pathlib import Path
 
 from ..config import load_config
 from ..progress import ORDER, plan_from_cfg, report, session_from_env
@@ -106,20 +108,29 @@ def run_stage(cfg, stage: str, args) -> dict | None:
             log().info("  cross-encoder disabled (ce.enabled=false)")
             return None
         from ..checkpoint import sync_now
+        from ..models import ce_parallel
         from ..models.cross_encoder import train_half
-        for h in (0, 1):
-            if not work_dir(cfg, None, "models", "ce", f"half{h}").exists() or args.force:
-                train_half(cfg, h)
-                sync_now(f"cross-encoder half {h} trained")  # a new session resumes with the next half
+        pending = [h for h in (0, 1) if not work_dir(cfg, None, "models", "ce", f"half{h}").exists() or args.force]
+        if len(pending) == 2 and ce_parallel.usable(cfg) and ce_parallel.train_halves(cfg, pending):
+            sync_now("cross-encoder halves trained (one per GPU)")
+        else:  # one GPU, one half left, or a worker failed: the sequential path (DataParallel over all GPUs)
+            for h in pending:
+                if args.force or not work_dir(cfg, None, "models", "ce", f"half{h}").exists():
+                    train_half(cfg, h)
+                    sync_now(f"cross-encoder half {h} trained")  # a new session resumes with the next half
     elif stage == "ce_infer":
         if not cfg.ce.enabled:
             return None
         from ..checkpoint import sync_now
+        from ..models import ce_parallel
         from ..models.cross_encoder import infer
         i, n = (int(x) for x in (args.shard or "0/1").split("/"))
         for s in _splits(args):
             if work_dir(cfg, s, "preds", f"ce_part{i:03d}.parquet").exists() and not args.force:
                 log().info("  CE %s shard %d/%d already scored (restored or earlier run)", s, i, n)
+                continue
+            if (i, n) == (0, 1) and ce_parallel.usable(cfg) and ce_parallel.infer_halves(cfg, s):
+                sync_now(f"cross-encoder scores for {s} (one half per GPU)")
                 continue
             infer(cfg, s, i, n)
             sync_now(f"cross-encoder scores for {s}")
@@ -170,6 +181,9 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.overrides)
+    cfg["_cli"] = {"config": str(Path(args.config).resolve()), "overrides": list(args.overrides)}  # for worker processes
+    if int(cfg.run.get("max_gpus", 0)) > 0:  # global GPU cap, read by every stage (and by worker processes via env)
+        os.environ["BER_MAX_GPUS"] = str(int(cfg.run.max_gpus))
     global _CFG
     _CFG = cfg
     set_seed(int(cfg.run.seed))

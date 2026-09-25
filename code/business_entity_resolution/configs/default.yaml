@@ -11,6 +11,7 @@ run:
   n_workers: -1                  # -1 = all cores
   cleanup: false                 # delete bulky intermediates once consumed (candidate-union files)
   inference_only: false          # audit mode: test split only, all models loaded from work_dir/models
+  max_gpus: 0                    # 0 = every stage uses all GPUs it can; 1 = force single-GPU behaviour everywhere (kill switch)
 
 checkpoint:                      # mirror the work dir to a PRIVATE Hugging Face dataset repo (see ber/checkpoint.py)
   enabled: false
@@ -45,7 +46,7 @@ blocking:
   vector_chunk: 200000
   name_addr_weight: 0.5          # N1 vector = [name, 0.5 * address]
   save_vectors: true             # keep RP vectors on disk (needed only by 2-hop expansion and the S1<->S1 diagnostic)
-  knn: {device: auto, mem_gb: 6.0}
+  knn: {device: auto, mem_gb: 6.0, max_gpus: 0}   # max_gpus: 0 = use every visible GPU for the kNN, 1 = one GPU
   a1: {k_fwd: 50, k_rev: 5, min_score: 0.15}
   n1: {k_fwd: 30, k_rev: 5, min_score: 0.15}
   keyblock: {max_block_s1: 200, max_block_pairs: 20000, admin_df_min: 30, admin_df_max: 200000,
@@ -67,6 +68,7 @@ blocking:
 gbdt_base: &gbdt
   backend: lightgbm              # falls back to xgboost if lightgbm is missing
   device: auto                   # xgboost only: auto | cpu | cuda
+  max_gpus: 0                    # xgboost: fold models train concurrently, one per GPU (0 = all GPUs)
   rounds: 3000
   early_stop: 100
   max_entities: 800000           # training S1 entities per fold (whole entities)
@@ -104,6 +106,7 @@ r1:
 
 ce:
   enabled: true
+  parallel_halves: true          # with >= 2 GPUs: train / score the two cross-fitted halves as one process per GPU
   model_name: BAAI/bge-reranker-v2-m3   # Apache-2.0, 568M; fallback microsoft/mdeberta-v3-base (MIT)
   device: auto
   max_len: 128
