@@ -16,10 +16,10 @@ import argparse
 import time
 
 from ..config import load_config
+from ..progress import ORDER, plan_from_cfg, report, session_from_env
 from ..utils import inference_only, log, mark_done, save_json, set_seed, stage_done, timer, work_dir
 
-PIPELINE = ["ingest", "eda", "mine", "normalize", "dense", "block", "prerank", "expand", "features", "r1",
-            "ce_train", "ce_infer", "r2", "gate", "tune", "predict", "outputs"]
+PIPELINE = list(ORDER)  # single source of truth: ber.progress.ORDER
 EXTRA = ["s1s1", "stress_check"]
 SPLITS = ("train", "test")
 
@@ -185,6 +185,15 @@ def main(argv=None) -> None:
         ckpt.reset()
     ckpt.restore()  # new session: pull finished stages from Hugging Face, so they are skipped below
     save_json(cfg, work_dir(cfg, None, "_last_config.json"))
+    t_main = time.time()
+    sess_start, sess_limit = session_from_env()
+
+    def show_progress():
+        for line in report(work_dir(cfg, None), plan_from_cfg(cfg), sess_start, sess_limit, t_main,
+                           hint="commit again to resume from the checkpoint" if ckpt.enabled else ""):
+            log().info(line)
+
+    show_progress()  # 0% on a fresh start; after a checkpoint restore it shows what is already finished
     for st in stages:
         if inference_only(cfg) and st in TRAIN_ONLY:
             log().info("⏭  %s skipped (inference_only)", st)
@@ -199,6 +208,7 @@ def main(argv=None) -> None:
             info = run_stage(cfg, st, args)
         mark_done(cfg, st, marker_split, {"seconds": round(time.time() - t0, 1), "info": info})
         ckpt.sync(f"stage {st} done")  # outputs + completion marker in one commit
+        show_progress()
 
 
 if __name__ == "__main__":

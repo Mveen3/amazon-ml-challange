@@ -94,6 +94,44 @@ def combined_vectors(name_rp: np.ndarray, addr_rp: np.ndarray, beta: float, chun
     return C
 
 
+def _docs(part: pl.DataFrame) -> tuple[list[str], list[str]]:
+    """(address docs, name docs) of one country partition, as plain strings for the hashing vectorizer."""
+    addr_docs = part["addr_latin"].str.replace_all(",", " ").to_list()
+    name = pl.when(pl.col("name_core").str.len_chars() > 0).then(pl.col("name_core")).otherwise(pl.col("name_latin"))
+    return addr_docs, part.select(name.alias("d"))["d"].to_list()
+
+
+def _vectors_from_docs(addr_docs: list[str], name_docs: list[str], vdir: Path, cfg, workers: int):
+    """Hashed char-3gram TF-IDF -> random projection -> (A: address vectors, C: [name, w*address] vectors)."""
+    A = build(addr_docs, vdir, "addr", cfg, workers)
+    N = build(name_docs, vdir, "name", cfg, workers)
+    C = combined_vectors(N, A, float(cfg.blocking.name_addr_weight))
+    return A, C
+
+
+def ensure_vectors(cfg, split: str, country: str) -> Path:
+    """Directory holding this country's projection vectors, rebuilding them if they are not on disk.
+
+    They are deterministic (hashing + seeded random projection), so a rebuild is bit-identical. They are
+    large, so they are deliberately not part of the Hugging Face checkpoint; a session that restores a
+    checkpoint between ``block`` and ``expand`` regenerates them here.
+    """
+    vdir = work_dir(cfg, split, "vec", safe(country))
+    if (vdir / "uids.npy").exists() and (vdir / "comb_rp.npy").exists():
+        return vdir
+    log().info("  rebuilding projection vectors for %s/%s (not on disk)", split, country)
+    part = load_country(cfg, split, country)
+    uids = part["uid"].to_numpy()
+    addr_docs, name_docs = _docs(part)
+    del part
+    ensure_dir(vdir)
+    A, C = _vectors_from_docs(addr_docs, name_docs, vdir, cfg, n_workers(cfg))
+    np.save(vdir / "uids.npy", uids)
+    np.save(vdir / "addr_rp.npy", A)
+    np.save(vdir / "comb_rp.npy", C)
+    return vdir
+
+
 def block_split(cfg, split: str) -> dict:
     bc = cfg.blocking
     workers = n_workers(cfg)
@@ -119,17 +157,11 @@ def block_split(cfg, split: str) -> dict:
                       pl.col("kt").n_unique().cast(pl.Int8).alias("key_n")]))
         gc.collect()
         vdir = ensure_dir(work_dir(cfg, split, "vec", safe(country)))
-        addr_docs = part["addr_latin"].str.replace_all(",", " ").to_list()
-        name_docs = pl.when(pl.col("name_core").str.len_chars() > 0).then(pl.col("name_core")) \
-            .otherwise(pl.col("name_latin"))
-        name_docs = part.select(name_docs.alias("d"))["d"].to_list()
+        addr_docs, name_docs = _docs(part)
         del part
         gc.collect()
-        A = build(addr_docs, vdir, "addr", cfg, workers)
-        N = build(name_docs, vdir, "name", cfg, workers)
+        A, C = _vectors_from_docs(addr_docs, name_docs, vdir, cfg, workers)
         del addr_docs, name_docs
-        C = combined_vectors(N, A, float(bc.name_addr_weight))
-        del N
         if bc.get("save_vectors", True):  # only 2-hop expansion and the S1<->S1 diagnostic need them later
             np.save(vdir / "uids.npy", uids)
             np.save(vdir / "addr_rp.npy", A)

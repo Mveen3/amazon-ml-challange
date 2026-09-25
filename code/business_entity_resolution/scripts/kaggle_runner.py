@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -45,7 +46,13 @@ class KaggleRun:
         self.input_root = input_root
         self.logs = self.working / "logs"
         self.logs.mkdir(parents=True, exist_ok=True)
-        self.t0 = time.time()
+        self.t0 = time.time()                 # session clock (Kaggle stops a session after 12 h)
+        self.heartbeat_s = 300                # seconds between automatic progress reports while a stage runs
+        self.session_limit_h = 12.0
+        self._last_line = ""
+        self._run_started = time.time()
+        if str(self.pkg / "src") not in sys.path:  # only for ber.progress / ber.config in this process
+            sys.path.insert(0, str(self.pkg / "src"))
         self.scratch_override = scratch
         self.scratch = self.data_dir = self.work_dir = None
         self.output_dir = self.pkg.parent.parent / "output"
@@ -67,7 +74,8 @@ class KaggleRun:
 
     def _env(self) -> dict:
         return dict(os.environ, PYTHONPATH=str(self.pkg / "src"), PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false",
-                    HF_HUB_DISABLE_PROGRESS_BARS="1", TRANSFORMERS_VERBOSITY="error")
+                    HF_HUB_DISABLE_PROGRESS_BARS="1", TRANSFORMERS_VERBOSITY="error",
+                    BER_SESSION_START=str(self.t0), BER_SESSION_LIMIT_H=str(self.session_limit_h))
 
     def _hours(self) -> str:
         return f"{(time.time() - self.t0) / 3600:.2f} h of 12"
@@ -143,6 +151,28 @@ class KaggleRun:
             sets.append("checkpoint.enabled=false")
         return sets
 
+    def status(self, sets: list[str] | None = None, activity: bool = False) -> None:
+        """Print the pipeline + session progress bars (elapsed, remaining, projected finish)."""
+        try:
+            from ber.config import load_config
+            from ber.progress import plan_from_cfg, report
+
+            sets = sets if sets is not None else self._sets() + self.overrides
+            cfg = load_config(self.pkg / self.config, sets)
+            hint = "commit again to resume from the checkpoint" if self.use_ckpt else "set USE_CROSS_ENCODER = False"
+            lines = report(cfg.paths.work_dir, plan_from_cfg(cfg), self.t0, self.session_limit_h, self._run_started,
+                           hint=hint)
+        except Exception as e:  # progress display must never break a run
+            lines = [f"(progress unavailable: {type(e).__name__}: {e})"]
+        stamp = time.strftime("%H:%M:%S")
+        print(f"\n[{stamp}] " + "\n           ".join(lines), flush=True)
+        if activity and self._last_line:
+            print(f"           last log line: {self._last_line[:110]}", flush=True)
+
+    def _heartbeat(self, stop: threading.Event, sets: list[str]) -> None:
+        while not stop.wait(self.heartbeat_s):
+            self.status(sets, activity=True)
+
     def run(self, stages: str, sets: list[str], log_name: str = "pipeline.log", fresh: bool = False) -> None:
         cmd = [sys.executable, "-u", "-m", "ber.pipeline.run", "--config", self.config, "--stage", stages]
         for s in sets:
@@ -150,16 +180,25 @@ class KaggleRun:
         if fresh:
             cmd.append("--fresh-start")
         print("$", " ".join(cmd))
-        t0 = time.time()
-        with open(self.logs / log_name, "a") as log:
-            p = subprocess.Popen(cmd, cwd=self.pkg, env=self._env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1)
-            for line in p.stdout:
-                print(line, end="")
-                log.write(line)
-                log.flush()
-            p.wait()
+        t0 = self._run_started = time.time()
+        stop = threading.Event()
+        beat = threading.Thread(target=self._heartbeat, args=(stop, sets), daemon=True)
+        beat.start()
+        try:
+            with open(self.logs / log_name, "a") as log:
+                p = subprocess.Popen(cmd, cwd=self.pkg, env=self._env(), stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+                for line in p.stdout:
+                    print(line, end="")
+                    log.write(line)
+                    log.flush()
+                    if line.strip():
+                        self._last_line = line.strip()
+                p.wait()
+        finally:
+            stop.set()
         print(f"\n[{stages}] exit {p.returncode} in {(time.time() - t0) / 60:.1f} min | session time used: {self._hours()}")
+        self.status(sets)
         if p.returncode != 0:
             raise RuntimeError(f"stage(s) '{stages}' failed - see the log above ({self.logs / log_name}). "
                                "Re-running this cell resumes at the failed stage.")

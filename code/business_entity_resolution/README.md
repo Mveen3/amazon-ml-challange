@@ -121,6 +121,22 @@ Any folder layout inside the zip works. The notebook finds the 7 TSV files where
 - **Failures:** an upload failure is logged and retried after the next stage. A missing token just turns checkpointing off.
 - **Locally:** set `checkpoint.enabled: true` (`--set checkpoint.enabled=true`); the token is then read from `.env`.
 
+### 4.3.2 Progress bars and the 12-hour budget (`ber/progress.py`)
+Every finished stage prints two bars, and the notebook repeats them every 5 minutes while a stage runs, with the latest log line so you can see it is alive:
+
+```
+PIPELINE  ███████░░░░░░░░░░░░░░░░░  29%  stage 6/16: prerank | worked 2h54m | remaining ~7h00m (estimate)
+SESSION   ██████░░░░░░░░░░░░░░░░░░  25%  of the 12h limit used (2h57m) | 9h02m left | pipeline projected to end at ~9h57m
+```
+- **How it works:** it reads the completion markers the pipeline already writes, so it cannot drift from what actually ran. Each stage has a rough weight, rescaled by how long finished stages really took.
+- **Accuracy:** the first number is only a rough prior (about 5 h). By the time `features` starts, it is typically within a few percent.
+- **Overrun warning:** if the projection exceeds the limit, the line ends with `!! may not finish in this session -> commit again to resume from the checkpoint`.
+- **Weekly quota:** Kaggle's weekly GPU-hour counter is not visible from code. It is shown in Kaggle's own notebook UI.
+- **Elsewhere:** the CLI prints the same PIPELINE bar after every stage, on AWS or locally.
+
+### 4.3.3 2-hop expansion is on
+It adds candidates found through a S1's already-confident records. It is applied only if it measurably raises the candidate ceiling, because extra candidates also add noise. On the 5k sample it added +0.00002 to +0.00005 of ceiling, and forcing it on lowered the sample score slightly (0.99740 vs 0.99800), so the gate declines there. On the real data it will apply it only if it finds a real gain. The decision is logged as `2-hop (...): ... gain +X, needs >= 0.00050 -> use=True/False` and saved in `work/models/prerank/expand.json`.
+
 ### 4.4 What `configs/kaggle.yaml` changes
 Only scale and speed settings change; the code path is the same as on AWS.
 
@@ -131,7 +147,8 @@ Only scale and speed settings change; the code path is the same as on AWS.
 | Random projections | 128-d instead of 256-d; fewer kNN neighbours | Memory |
 | Exact-key blocks | At most 50 S1 and 5,000 pairs per block (instead of 200 and 20,000) | Memory. Measured on the full US train data: larger blocks are generic names that add only look-alikes. |
 | Model training | Sample of 500k entities | Memory. Every pair is still scored. |
-| Saved vectors / 2-hop expansion | Off | Disk |
+| 2-hop expansion | On, but self-gated: decided on a 250k-entity probe, run on everything only if it raises the candidate ceiling by ≥ 0.0005 | Costs minutes if it does not help; never lowers accuracy when it does not help (§4.3.2) |
+| Projection vectors | Saved to the scratch disk (~10 GB of the 1.2 TB), not checkpointed; rebuilt on demand | 2-hop needs them |
 | Cross-encoder | `intfloat/multilingual-e5-small` (MIT, 118M parameters) on both T4s, fp16 | Time |
 | Work files | On the scratch disk, not the 20 GB `/kaggle/working` | Disk |
 
@@ -272,11 +289,12 @@ The local layout (`code/business_entity_resolution/`) is the layout the challeng
 | `blocking.a1/n1.k_fwd/k_rev` | Neighbours per S1 / per record in the address and name+address channels |
 | `blocking.keyblock.*` | Exact-key block caps and the document-frequency band for locality tokens |
 | `blocking.dense.enabled` | Optional bi-encoder channel (enable only if the best achievable score needs it) |
-| `blocking.save_vectors` | Keep projection vectors on disk (needed only by 2-hop expansion and the S1↔S1 diagnostic) |
+| `blocking.save_vectors` | Keep projection vectors on disk (needed by 2-hop expansion and the S1↔S1 diagnostic; rebuilt on demand if missing) |
 | `prerank/r1/r2.sample_entities` | S1 entities whose rows train each GBDT; scoring always covers every pair |
 | `prerank.chunk_rows`, `features.shard_rows`, `features.join_rows` | Rows processed at a time (lower them if memory is tight) |
 | `gbdt_base.backend`, `*.gbdt.device` | `lightgbm` or `xgboost`; XGBoost device `auto`, `cpu` or `cuda` |
 | `ingest.train_s1_frac` | Train on a fraction of the train clusters (time valve; test is never subsampled) |
+| `expand.probe_entities`, `expand.min_gain` | 2-hop: decide on a sample of N train entities (0 = all); required ceiling gain |
 | `run.cleanup` | Delete the candidate-union files after the pre-ranker has used them |
 | `checkpoint.*` | Private Hugging Face checkpointing of the work dir: `enabled`, `repo_id`/`repo_name`, `prefix` (one folder per independent run), `token_env`, `exclude` |
 | `prerank.ceiling_tol` | Allowed best-achievable-score loss when choosing the pre-ranker floor (default 0.0002) |

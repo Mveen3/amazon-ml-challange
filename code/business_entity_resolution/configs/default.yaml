@@ -18,7 +18,8 @@ checkpoint:                      # mirror the work dir to a PRIVATE Hugging Face
   repo_name: amazon-ml-ber-work
   prefix: full                   # folder inside the repo; a different prefix = an independent run
   token_env: HF_TOKEN            # env var with a WRITE token (Kaggle: a Kaggle Secret; local: .env)
-  exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*/cands/pre_parts/*", "rp_matrix.npy", "_last_config.json"]
+  exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*/cands/pre_parts/*", "rp_matrix.npy", "_last_config.json",
+            "*/vec/*/comb_rp.npy", "*/vec/*/addr_rp.npy"]   # big and deterministic: rebuilt on demand
 
 ingest:
   train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
@@ -88,7 +89,8 @@ prerank:
   max_per_s1: 60
   chunk_rows: 5000000            # union pairs scored per chunk (bounds RAM)
 
-expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10, min_gain: 0.0005}
+expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10, min_gain: 0.0005,
+         probe_entities: 0}      # 0 = evaluate on all train entities; N = decide on a sample of N first
 
 features:
   shard_rows: 500000             # pairs per round-1 feature shard (one worker task)

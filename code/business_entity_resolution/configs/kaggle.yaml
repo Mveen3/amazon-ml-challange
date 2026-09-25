@@ -23,7 +23,8 @@ mining: {max_pairs: 1500000}
 blocking:
   rp_dim: 128                        # halves vector memory; recall impact is small
   vector_chunk: 100000
-  save_vectors: false                # ~20 GB of vectors would not fit; only 2-hop / S1<->S1 need them
+  save_vectors: true                 # 2-hop expansion + S1<->S1 diagnostic read them. ~10 GB on the 1.2 TB scratch disk;
+                                     # not checkpointed to Hugging Face (rebuilt on demand, see ensure_vectors)
   knn: {device: auto, mem_gb: 3.0}   # T4: 15 GB, index + query chunks stay well below
   a1: {k_fwd: 30, k_rev: 3}
   n1: {k_fwd: 20, k_rev: 3}
@@ -37,7 +38,11 @@ prerank:
   chunk_rows: 3000000
   gbdt: {backend: xgboost, device: auto, max_entities: 400000, rounds: 600}
 
-expand: {enabled: false}             # needs saved vectors; gave no gain on the sample
+expand:
+  enabled: true
+  probe_entities: 250000             # decide on a sample of train S1s (minutes); run on everything only if it helps
+  min_gain: 0.0005                   # required rise of the candidate ceiling: 10x the probe noise, and above the
+                                     # small precision cost extra candidates carry (seen on the sample)
 
 features:
   shard_rows: 300000
