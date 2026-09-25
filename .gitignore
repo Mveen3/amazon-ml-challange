@@ -1,0 +1,22 @@
+# Competition data: never commit (licence + GitHub's 100 MB file limit). Upload it to AWS separately.
+dataset/
+code/business_entity_resolution/sample_data/
+
+# Generated artefacts (regenerable from code + data)
+code/business_entity_resolution/work/
+code/business_entity_resolution/work_*/
+code/business_entity_resolution/output_smoke/
+output/
+*_submission.zip
+*_models.tar.gz
+
+# Python / editor noise
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+# Restricted
+.hidden/

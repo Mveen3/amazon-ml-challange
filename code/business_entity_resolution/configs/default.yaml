@@ -1,0 +1,137 @@
+# Full-scale configuration (see docs/Pipeline_Architecture.md).
+# Relative paths resolve against code/business_entity_resolution/ (the parent of configs/).
+paths:
+  data_dir: ../../dataset
+  work_dir: work
+  output_dir: ../../output
+  validator: ../../utils/validate_submission.py
+
+run:
+  seed: 42
+  n_workers: -1                  # -1 = all cores
+
+folds:
+  n_folds: 5
+  neural_halves: [[0, 1, 2], [3, 4]]   # cross-fitting halves for neural models
+
+normalize:
+  chunk_size: 100000
+
+mining:
+  enabled: true
+  max_pairs: 3000000
+  min_support: 20                # distinct S1 entities supporting a mapping (leak safety)
+  min_share: 0.6
+  affix_rate: 0.3
+
+blocking:
+  ngram: [3, 3]
+  hash_features: 262144
+  rp_dim: 256
+  vector_chunk: 200000
+  name_addr_weight: 0.5          # N1 vector = [name, 0.5 * address]
+  knn: {device: auto, mem_gb: 6.0}
+  a1: {k_fwd: 50, k_rev: 5, min_score: 0.15}
+  n1: {k_fwd: 30, k_rev: 5, min_score: 0.15}
+  keyblock: {max_block_s1: 200, max_block_pairs: 20000, admin_df_min: 30, admin_df_max: 200000,
+         loc_tokens: 3, rare_tokens: 2, num_tokens: 2}
+  dense:                         # optional D1 channel; enable only if the ceiling analysis needs it
+    enabled: false
+    model_name: intfloat/multilingual-e5-base
+    device: auto
+    max_pairs: 2000000
+    batch_size: 256
+    lr: 2.0e-5
+    scale: 20.0
+    max_len: 64
+    infer_batch_size: 1024
+    k_fwd: 30
+    k_rev: 5
+    min_score: 0.3
+
+gbdt_base: &gbdt
+  backend: lightgbm              # falls back to xgboost if lightgbm is missing
+  rounds: 3000
+  early_stop: 100
+  max_entities: 800000           # training S1 entities per fold (whole entities)
+  es_frac: 0.05
+  params: {learning_rate: 0.05, num_leaves: 255, min_data_in_leaf: 100, feature_fraction: 0.8,
+           bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
+
+prerank:
+  gbdt:
+    <<: *gbdt
+    rounds: 800
+    max_entities: 600000
+    params: {learning_rate: 0.08, num_leaves: 63, min_data_in_leaf: 200, feature_fraction: 0.9,
+             bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
+  floor_grid: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12]
+  ceiling_tol: 0.0002             # blocking losses are unrecoverable; stay close to the union ceiling
+  keep_rev_top: 2
+  floor_low: 0.0005
+  max_per_s1: 60
+  chunk_rows: 20000000           # pairs per chunk when joining text for cheap features
+
+expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10, min_gain: 0.0005}
+
+features:
+  n_shards: 256
+  rare_df: 50                    # tokens with df <= rare_df count as "rare" in diff signatures
+
+r1:
+  gbdt: *gbdt
+  monotone: []                   # ablation for France: e.g. [ad_tfidf, num_hit, nm_tset]
+
+ce:
+  enabled: true
+  model_name: BAAI/bge-reranker-v2-m3   # Apache-2.0, 568M; fallback microsoft/mdeberta-v3-base (MIT)
+  device: auto
+  max_len: 128
+  batch_size: 64
+  infer_batch_size: 512
+  lr: 2.0e-5
+  warmup: 0.05
+  epochs: 1
+  neg_ratio: 3
+  max_pos: 1500000
+  band: [0.02, 0.98]
+  top_rank: 3
+
+r2:
+  gbdt: *gbdt
+  monotone: []
+  conf_tau: 0.8
+  top_members: 8
+  chunk_s1: 200000
+
+gate:
+  gbdt:
+    <<: *gbdt
+    rounds: 1500
+    max_entities: 3000000
+    params: {learning_rate: 0.05, num_leaves: 63, min_data_in_leaf: 100, feature_fraction: 0.9,
+             bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
+
+decision:
+  fallback_profile: us           # thresholds/calibration for profiles without training data (France)
+  max_members: 12
+  caps: {2: 5, 3: 6}             # verified maxima of S2 / S3 records per S1
+  # t_add_base[k] = expected-F0.5 break-even for adding a member when k are selected (docs App. B)
+  t_add_base: [0.727, 0.727, 0.759, 0.771, 0.778, 0.782, 0.785, 0.787, 0.789, 0.790, 0.791, 0.792]
+  grid:
+    kappa: [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2]
+    t_min: [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
+    delta: [-0.35, -0.3, -0.25, -0.2, -0.15, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15]
+  overrides: {}                  # probes, e.g. {france: {delta_shift: 0.05}} or {france: {empty: true}}
+
+stress:
+  enabled: true
+  drop_frac: 0.19
+  force: false                   # use the stress objective even if the check rejects the hypothesis
+
+s1s1:
+  queries: 200000
+  train_rows: 5000000
+  gbdt:
+    <<: *gbdt
+    rounds: 400

@@ -1,0 +1,26 @@
+# conda env create -f environment.yml   ->   conda activate ml
+name: ml
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - polars=1.41.2
+  - pyarrow=24.0.0
+  - numpy=2.0.1
+  - scipy=1.16.0
+  - scikit-learn=1.9.0
+  - rapidfuzz=3.14.1
+  - lightgbm=4.7.0
+  - xgboost=3.3.0
+  - pyyaml=6.0.3
+  - pip
+  - pip:
+      # PyPI wheels for the GPU stack (conda builds of transformers lag behind)
+      - torch==2.5.1
+      - transformers==4.46.3
+      - tokenizers==0.20.3
+      - huggingface-hub==0.26.5
+      - safetensors==0.4.5
+      - sentencepiece==0.2.0
+      - protobuf==5.28.3

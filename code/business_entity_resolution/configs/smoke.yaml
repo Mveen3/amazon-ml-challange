@@ -1,0 +1,28 @@
+# Tiny end-to-end smoke test on sample_data/ (build it with scripts/make_sample.py).
+inherit: default.yaml
+paths:
+  data_dir: sample_data
+  work_dir: work_smoke
+  output_dir: output_smoke
+run: {n_workers: 4}
+normalize: {chunk_size: 5000}
+mining: {max_pairs: 200000, min_support: 3}
+blocking:
+  vector_chunk: 20000
+  knn: {device: cpu, mem_gb: 0.5}
+  a1: {k_fwd: 20}
+  n1: {k_fwd: 15}
+  keyblock: {admin_df_min: 5, admin_df_max: 3000}
+prerank: {gbdt: {rounds: 150, early_stop: 30}}
+features: {n_shards: 4}
+r1: {gbdt: {rounds: 300, early_stop: 30, params: {learning_rate: 0.1, num_leaves: 31, min_data_in_leaf: 20,
+                                                 feature_fraction: 0.9, bagging_fraction: 0.8, bagging_freq: 1,
+                                                 lambda_l2: 1.0, max_bin: 255}}}
+ce: {enabled: false}
+r2: {gbdt: {rounds: 300, early_stop: 30, params: {learning_rate: 0.1, num_leaves: 31, min_data_in_leaf: 20,
+                                                 feature_fraction: 0.9, bagging_fraction: 0.8, bagging_freq: 1,
+                                                 lambda_l2: 1.0, max_bin: 255}}, chunk_s1: 2000}
+gate: {gbdt: {rounds: 200, early_stop: 30}}
+decision:
+  grid: {kappa: [0.6, 0.8, 1.0], t_min: [0.05, 0.2], delta: [-0.2, -0.1, 0.0, 0.05]}
+s1s1: {queries: 500, train_rows: 50000, gbdt: {rounds: 50}}
