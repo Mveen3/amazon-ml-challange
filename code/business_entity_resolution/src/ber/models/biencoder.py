@@ -16,6 +16,7 @@ import polars as pl
 
 from ..blocking.candidates import CHANNELS, _hits, safe
 from ..blocking.knn import topk
+from .cross_encoder import _amp_dtype
 from ..utils import ensure_dir, log, torch_device, work_dir
 
 
@@ -34,7 +35,7 @@ def _encode(model, tok, texts: list[str], device, bs: int, max_len: int) -> np.n
             idx = order[s:s + bs]
             enc = tok([texts[i] for i in idx], padding=True, truncation=True, max_length=max_len,
                       return_tensors="pt").to(device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast(device_type=device.type, dtype=_amp_dtype(), enabled=device.type == "cuda"):
                 h = model(**enc).last_hidden_state
             m = enc["attention_mask"].unsqueeze(-1).to(h.dtype)
             e = (h * m).sum(1) / m.sum(1).clamp(min=1)
@@ -71,7 +72,7 @@ def train(cfg) -> None:
         for step, idx in enumerate(batches):
             ea = tok([ta[i] for i in idx], padding=True, truncation=True, max_length=int(dc.max_len), return_tensors="pt").to(device)
             eb = tok([tb[i] for i in idx], padding=True, truncation=True, max_length=int(dc.max_len), return_tensors="pt").to(device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast(device_type=device.type, dtype=_amp_dtype(), enabled=device.type == "cuda"):
                 ha, hb = model(**ea).last_hidden_state, model(**eb).last_hidden_state
             ma, mb = ea["attention_mask"].unsqueeze(-1), eb["attention_mask"].unsqueeze(-1)
             va = torch.nn.functional.normalize(((ha * ma).sum(1) / ma.sum(1)).float(), dim=-1)

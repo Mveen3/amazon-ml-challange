@@ -9,6 +9,11 @@ paths:
 run:
   seed: 42
   n_workers: -1                  # -1 = all cores
+  cleanup: false                 # delete bulky intermediates once consumed (candidate-union files)
+  inference_only: false          # audit mode: test split only, all models loaded from work_dir/models
+
+ingest:
+  train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
 
 folds:
   n_folds: 5
@@ -30,6 +35,7 @@ blocking:
   rp_dim: 256
   vector_chunk: 200000
   name_addr_weight: 0.5          # N1 vector = [name, 0.5 * address]
+  save_vectors: true             # keep RP vectors on disk (needed only by 2-hop expansion and the S1<->S1 diagnostic)
   knn: {device: auto, mem_gb: 6.0}
   a1: {k_fwd: 50, k_rev: 5, min_score: 0.15}
   n1: {k_fwd: 30, k_rev: 5, min_score: 0.15}
@@ -51,6 +57,7 @@ blocking:
 
 gbdt_base: &gbdt
   backend: lightgbm              # falls back to xgboost if lightgbm is missing
+  device: auto                   # xgboost only: auto | cpu | cuda
   rounds: 3000
   early_stop: 100
   max_entities: 800000           # training S1 entities per fold (whole entities)
@@ -59,6 +66,7 @@ gbdt_base: &gbdt
            bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
 
 prerank:
+  sample_entities: 800000        # S1 entities whose union rows train the pre-ranker (scoring covers all)
   gbdt:
     <<: *gbdt
     rounds: 800
@@ -70,15 +78,17 @@ prerank:
   keep_rev_top: 2
   floor_low: 0.0005
   max_per_s1: 60
-  chunk_rows: 20000000           # pairs per chunk when joining text for cheap features
+  chunk_rows: 5000000            # union pairs scored per chunk (bounds RAM)
 
 expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10, min_gain: 0.0005}
 
 features:
-  n_shards: 256
+  shard_rows: 500000             # pairs per round-1 feature shard (one worker task)
+  join_rows: 4000000             # pairs joined with parsed text at a time when writing shards
   rare_df: 50                    # tokens with df <= rare_df count as "rare" in diff signatures
 
 r1:
+  sample_entities: 1000000       # S1 entities loaded for training; OOF/test scoring streams over all shards
   gbdt: *gbdt
   monotone: []                   # ablation for France: e.g. [ad_tfidf, num_hit, nm_tset]
 
@@ -96,8 +106,10 @@ ce:
   max_pos: 1500000
   band: [0.02, 0.98]
   top_rank: 3
+  infer_chunk: 1000000           # pairs turned into text and scored at a time
 
 r2:
+  sample_entities: 1000000
   gbdt: *gbdt
   monotone: []
   conf_tau: 0.8
@@ -131,7 +143,7 @@ stress:
 
 s1s1:
   queries: 200000
-  train_rows: 5000000
+  train_entities: 300000
   gbdt:
     <<: *gbdt
     rounds: 400

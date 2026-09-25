@@ -18,13 +18,18 @@ raw TSV ─► 0 normalise ─► 1 candidates (TF-IDF/RP kNN + keys ─► pre-
 code/business_entity_resolution/
 ├── README.md                    this file
 ├── requirements.txt             pinned (pip)
+├── requirements-kaggle.txt      the few extra packages a Kaggle image needs
 ├── environment.yml              pinned (conda env "ml")
 ├── configs/
 │   ├── default.yaml             full-scale settings (every knob documented inline)
+│   ├── kaggle.yaml              Kaggle profile: 2x T4, 4 CPU cores, ~29 GB RAM, 12 h sessions
 │   └── smoke.yaml               tiny end-to-end test on sample_data/
+├── kaggle/
+│   └── amazon_ml_kaggle.ipynb   Kaggle notebook: imports data + code, trains, writes the submission
 ├── scripts/
 │   ├── make_sample.py           build sample_data/ from the training set
 │   ├── score_sample.py          score smoke-test outputs against the hidden sample truth
+│   ├── kaggle_prepare.py        find/unpack the Kaggle dataset and link it into the expected layout
 │   └── package_submission.sh    build <team>_submission.zip (+ optional models bundle)
 └── src/ber/
     ├── io.py                    TSV → Parquet, unified uid space, output writers
@@ -32,7 +37,8 @@ code/business_entity_resolution/
     ├── mining/tables.py         token / abbreviation / component / affix tables mined from train pairs
     ├── blocking/                RP-TF-IDF vectors, GPU/CPU kNN, key blocking, union, pre-ranker, 2-hop
     ├── features/                round-1 pair features, diff signatures, context, round-2 consensus
-    ├── models/                  GBDT wrapper + OOF, calibration, cross-encoder, bi-encoder, rounds, gate
+    ├── models/                  GBDT wrapper + OOF, out-of-core streaming, calibration, cross-encoder,
+    │                            bi-encoder, rounds, gate
     ├── decision/                vectorised set selection and threshold tuning
     ├── eval/                    exact metric + ceiling, stress test, S1↔S1 diagnostic
     ├── eda/profile.py           recomputes the data facts of the architecture doc (§2)
@@ -40,6 +46,14 @@ code/business_entity_resolution/
 ```
 
 All intermediate artefacts go to `work/` (Parquet, `.npy` and model files). Each stage writes a completion marker, so the pipeline **resumes** where it stopped.
+
+**Memory model.** No stage holds the whole pair table in RAM:
+- Candidates are written per country.
+- The pre-ranker scores them in chunks.
+- Round-1 features live in shards of contiguous S1 ranges.
+- Each GBDT trains on the rows of a random sample of whole entities (`*.sample_entities`), then scores every pair shard by shard. Train rows are scored out-of-fold.
+
+Peak RAM therefore depends on the largest country partition and the training sample, not on the total number of pairs.
 
 ---
 
@@ -68,13 +82,63 @@ The pseudo-test split relabels about 30% of US clusters as "France", to exercise
 
 ---
 
-## 4. Full run on AWS
+## 4. Full run on Kaggle (2× T4)
 
-### 4.1 Machines
+`kaggle/amazon_ml_kaggle.ipynb` does everything:
+1. imports the dataset;
+2. clones this repository from GitHub;
+3. installs the few missing packages;
+4. runs the pipeline with `configs/kaggle.yaml`;
+5. writes the submission files, the submission zip and a models bundle to `/kaggle/working`.
+
+### 4.1 One-time: upload the data as a Kaggle Dataset
+1. Zip your local `dataset/` folder (the one containing `train/` and `test/`) into `amazon-ml.zip`.
+2. On kaggle.com go to **Datasets → New Dataset**, drag in `amazon-ml.zip`, set the title to `amazon-ml`, keep it **Private**, and click **Create**.
+
+Any folder layout inside the zip works. The notebook finds the 7 TSV files wherever they are, and unpacks the archive itself if Kaggle left it zipped.
+
+### 4.2 Create the notebook
+1. On kaggle.com go to **Create → New Notebook**.
+2. **File → Import Notebook**, and upload `kaggle/amazon_ml_kaggle.ipynb` (download it from GitHub first).
+3. In the right-hand panel, set **Accelerator → GPU T4 x2** and **Internet → On**. Internet requires a phone-verified account.
+4. **Add Input → Datasets → Your Datasets →** `amazon-ml`.
+5. In the first code cell, set `TEAM_NAME`. Also set `DATASET_SLUG` if you named the dataset differently.
+
+### 4.3 Run
+- **Check first:** set `RUN_SMOKE_FIRST = True` and `RUN_FULL = False`, then **Run All**. This takes about 10–15 minutes and runs the whole pipeline on a 5k-entity sample, including the real cross-encoder on the GPU.
+- **Full run:** set `RUN_FULL = True`, then **Save Version → Save & Run All (Commit)**. It keeps running after you close the browser. Kaggle stops any session at 12 hours.
+- **Results:** open the version's **Output** tab. It contains `matching_results.tsv` (upload this to the portal), `<team>_submission.zip`, `<team>_models.tar.gz`, `reports/` (out-of-fold F0.5 and so on) and `logs/`.
+
+### 4.4 What `configs/kaggle.yaml` changes
+Only scale and speed settings change; the code path is the same as on AWS.
+
+| Setting | Kaggle value | Why |
+|---|---|---|
+| Folds | 4 instead of 5 | Time |
+| GBDT | XGBoost on GPU instead of LightGBM on CPU | Kaggle has only 4 CPU cores |
+| Random projections | 128-d instead of 256-d; fewer kNN neighbours | Memory |
+| Model training | Sample of 500k entities | Memory. Every pair is still scored. |
+| Saved vectors / 2-hop expansion | Off | Disk |
+| Cross-encoder | `intfloat/multilingual-e5-small` (MIT, 118M parameters) on both T4s, fp16 | Time |
+| Work files | On the scratch disk, not the 20 GB `/kaggle/working` | Disk |
+
+### 4.5 If the 12-hour limit is tight
+Full-scale runtime on Kaggle has **not been measured**. The notebook prints the session time used after every stage. To shorten a run:
+- Set `USE_CROSS_ENCODER = False`. This saves roughly 1–1.5 hours.
+- Set `EXTRA_OVERRIDES = ["ingest.train_s1_frac=0.6"]` to train on 60% of the train clusters. The test set is never subsampled.
+- Set `EXTRA_OVERRIDES = ["r1.gbdt.rounds=1000", "r2.gbdt.rounds=1000"]`.
+
+A session that hits the limit loses its scratch files, and the next run starts over. Completed stages are skipped only within the same session.
+
+---
+
+## 5. Full run on AWS
+
+### 5.1 Machines
 
 | Box | Suggested instance | Used for |
 |---|---|---|
-| CPU | `r7i.16xlarge` (64 vCPU, 512 GiB) or larger | every stage except the neural ones; the pre-ranker union for train is about 150–200M pairs |
+| CPU | `r7i.16xlarge` (64 vCPU, 512 GiB) or `r7i.8xlarge` (256 GiB) | every stage except the neural ones (all stages stream, so RAM mostly sets how large the training samples can be) |
 | GPU | `g6e.2xlarge` (L40S 48 GB) or `p4d`/`p5` | kNN (much faster on GPU), cross-encoder train/infer, optional bi-encoder |
 
 A single GPU box with enough RAM (for example `g6e.16xlarge`, 512 GiB) can run everything.
@@ -84,7 +148,7 @@ A single GPU box with enough RAM (for example `g6e.16xlarge`, 512 GiB) can run e
   - kNN falls back to multithreaded CPU matmul; set `blocking.knn.device: cpu`. This takes hours rather than minutes.
   - Set `ce.enabled: false`.
 
-### 4.2 Commands
+### 5.2 Commands
 
 From `code/business_entity_resolution/`, with the challenge data in `../../dataset/{train,test}`:
 
@@ -114,7 +178,7 @@ $R --stage r2,gate,tune,predict,outputs     # CPU: round 2, gate, thresholds, su
 - **Continuing from a stage:** `--from <stage>`.
 - **Changing a config value on the command line:** `--set key.sub=value`.
 
-### 4.3 Outputs
+### 5.3 Outputs
 
 - `../../output/matching_results.tsv` is the file that gets scored.
 - `../../output/candidate_pairs.tsv` is the final candidate set. It is written *after* the 2-hop expansion, so every match is guaranteed to be one of the candidates.
@@ -129,7 +193,7 @@ $R --stage r2,gate,tune,predict,outputs     # CPU: round 2, gate, thresholds, su
 
 ---
 
-## 5. Leaderboard probes
+## 6. Leaderboard probes
 
 The doc's §12 plan is to spend submissions only on questions that validation cannot answer. Each probe writes to `../../output/probes/<name>/` and leaves the main submission untouched.
 
@@ -146,7 +210,7 @@ $R --stage predict,outputs --probe fr_loose  --set decision.overrides.france.del
 
 ---
 
-## 6. Reproducibility and audit
+## 7. Reproducibility and audit
 
 - **Deterministic:**
   - Seeded RNGs; LightGBM runs with `deterministic` and `force_col_wise`.
@@ -173,12 +237,14 @@ $R --stage predict,outputs --probe fr_loose  --set decision.overrides.france.del
 
 ---
 
-## 7. Packaging
+## 8. Packaging
 
 ```bash
 bash scripts/package_submission.sh <team_name>              # -> ../../<team_name>_submission.zip
 bash scripts/package_submission.sh <team_name> --with-models   # + ../../<team_name>_models.tar.gz
 ```
+
+On Kaggle the notebook's last cell runs this for you. It sets `WORK_DIR`, `DATA_DIR` and `OUT_DIR` because those directories live on scratch disk there; `RESULTS_DIR` can also be overridden.
 
 Fill in `docs/Documentation Template.md` before packaging; it is copied into the zip as `Documentation_template.md`.
 
@@ -186,13 +252,19 @@ The local layout (`code/business_entity_resolution/`) is the layout the challeng
 
 ---
 
-## 8. Key configuration knobs (`configs/default.yaml`)
+## 9. Key configuration knobs (`configs/default.yaml`)
 
 | Knob | Meaning |
 |---|---|
 | `blocking.a1/n1.k_fwd/k_rev` | Neighbours per S1 / per record in the address and name+address channels |
 | `blocking.keyblock.*` | Exact-key block caps and the document-frequency band for locality tokens |
 | `blocking.dense.enabled` | Optional bi-encoder channel (enable only if the best achievable score needs it) |
+| `blocking.save_vectors` | Keep projection vectors on disk (needed only by 2-hop expansion and the S1↔S1 diagnostic) |
+| `prerank/r1/r2.sample_entities` | S1 entities whose rows train each GBDT; scoring always covers every pair |
+| `prerank.chunk_rows`, `features.shard_rows`, `features.join_rows` | Rows processed at a time (lower them if memory is tight) |
+| `gbdt_base.backend`, `*.gbdt.device` | `lightgbm` or `xgboost`; XGBoost device `auto`, `cpu` or `cuda` |
+| `ingest.train_s1_frac` | Train on a fraction of the train clusters (time valve; test is never subsampled) |
+| `run.cleanup` | Delete the candidate-union files after the pre-ranker has used them |
 | `prerank.ceiling_tol` | Allowed best-achievable-score loss when choosing the pre-ranker floor (default 0.0002) |
 | `expand.*` | 2-hop expansion; applied to test only if it raised the train best achievable score by `min_gain` |
 | `r1/r2.monotone` | Monotone-constraint ablation for France robustness |
@@ -205,9 +277,11 @@ The local layout (`code/business_entity_resolution/`) is the layout the challeng
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
-- **Out of memory in `prerank`:** lower `prerank.chunk_rows` and/or `blocking.a1.k_fwd`.
+- **Out of memory:** lower `prerank.chunk_rows`, `features.join_rows` and `*.sample_entities`. In `block`, also lower `blocking.a1/n1.k_fwd`.
+- **Kaggle "missing train_source1.tsv …":** the dataset is not attached (**Add Input**), or `DATASET_SLUG` does not match its folder name under `/kaggle/input`.
+- **Kaggle `git clone` fails:** switch **Internet** on in the notebook settings (it needs a phone-verified account).
 - **Slow kNN:** check that the log line `knn: ... on cuda` appears; tune `blocking.knn.mem_gb` to fit your GPU.
 - **Validator warning (a match outside the candidates):** this cannot happen by construction; `outputs` asserts it. If it appears, re-run `expand` and `features` so both files come from the same run.
 - **LightGBM missing:** the wrapper falls back to XGBoost automatically (`gbdt_base.backend`).

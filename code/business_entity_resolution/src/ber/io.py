@@ -24,6 +24,7 @@ def _read_tsv(path: Path) -> pl.DataFrame:
 
 def ingest(cfg, split: str) -> None:
     data = Path(cfg.paths.data_dir) / split
+    frac = float(cfg.get("ingest", {}).get("train_s1_frac", 1.0)) if split == "train" else 1.0
     frames = []
     for src in SOURCES:
         df = _read_tsv(data / f"{split}_source{src}.tsv")
@@ -35,8 +36,11 @@ def ingest(cfg, split: str) -> None:
         ]).with_columns(pl.lit(src, dtype=pl.Int8).alias("src"))
         frames.append(df)
         log().info("  %s S%d: %d rows", split, src, df.height)
+    if frac < 1.0:
+        frames = _subsample_train(frames, data / "train_ground_truth.tsv", frac, int(cfg.run.seed))
     rec = pl.concat(frames).with_row_index("uid").with_columns(pl.col("uid").cast(pl.Int64))
-    rec = rec.with_columns(pl.col("country").map_elements(profile_name, return_dtype=pl.Utf8).alias("prof"))
+    prof_map = {c: profile_name(c) for c in rec["country"].unique().to_list()}
+    rec = rec.with_columns(pl.col("country").replace_strict(prof_map, return_dtype=pl.Utf8).alias("prof"))
     out = ensure_dir(work_dir(cfg, split))
     rec.write_parquet(out / "records.parquet")
 
@@ -51,6 +55,31 @@ def ingest(cfg, split: str) -> None:
     else:
         s1 = s1.with_columns([pl.lit(None, dtype=pl.Int32).alias("n_true"), pl.lit(-1, dtype=pl.Int8).alias("fold")])
     s1.write_parquet(out / "s1.parquet")
+
+
+def _subsample_train(frames: list[pl.DataFrame], gt_path: Path, frac: float, seed: int) -> list[pl.DataFrame]:
+    """Keep a fraction of S1 clusters (with all their records) and the same fraction of unmatched records.
+
+    Preserves cluster sizes and the unmatched-record rate; only the number of look-alike S1 siblings
+    shrinks. A time-saving valve for small machines -- leave at 1.0 for the real run if you can.
+    """
+    gt = _read_tsv(gt_path)
+    s1_ids = frames[0]["eid"]
+    keep_s1 = s1_ids.sample(fraction=frac, seed=seed)
+    pairs = (gt.with_columns(pl.col("matched_entity_ids").str.split(",")).explode("matched_entity_ids")
+             .select([pl.col("source1_entity_id").str.strip_chars().alias("s1"),
+                      pl.col("matched_entity_ids").str.strip_chars().alias("eid")])
+             .filter(pl.col("eid").str.len_chars() > 0))
+    keep_rec = pairs.filter(pl.col("s1").is_in(keep_s1.implode()))["eid"]
+    matched = pairs["eid"]
+    out = [frames[0].filter(pl.col("eid").is_in(keep_s1.implode()))]
+    for i, df in enumerate(frames[1:]):
+        orphan = ~pl.col("eid").is_in(matched.implode())
+        orphans = df.filter(orphan).sample(fraction=frac, seed=seed + i + 1)
+        out.append(pl.concat([df.filter(pl.col("eid").is_in(keep_rec.implode())), orphans]))
+    log().info("  train subsampled to %.0f%% of S1 clusters: %d S1, %d records", 100 * frac, out[0].height,
+               sum(f.height for f in out[1:]))
+    return out
 
 
 def _read_truth(path: Path, rec: pl.DataFrame) -> pl.DataFrame:

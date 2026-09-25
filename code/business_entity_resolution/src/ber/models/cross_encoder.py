@@ -16,14 +16,18 @@ import numpy as np
 import polars as pl
 
 from ..features.pair import load_r1
-from ..utils import ensure_dir, log, torch_device, work_dir
+from ..utils import chunks, ensure_dir, log, torch_device, work_dir
 
 BUCKET_COLS = ["nm_core_eq", "nm_tset", "ad_tset", "num_hit", "legal_diff", "legal_s_only", "legal_r_only"]
 
 
-def _texts(cfg, split: str, df: pl.DataFrame) -> tuple[list[str], list[str]]:
+def text_table(cfg, split: str) -> pl.DataFrame:
+    """uid -> "name | address" (raw text: the model sees exactly what the data provides) + source."""
     rec = pl.read_parquet(work_dir(cfg, split, "records.parquet"), columns=["uid", "name_raw", "addr_raw", "src"])
-    txt = rec.with_columns((pl.col("name_raw") + " | " + pl.col("addr_raw")).alias("t")).select(["uid", "t", "src"])
+    return rec.with_columns((pl.col("name_raw") + " | " + pl.col("addr_raw")).alias("t")).select(["uid", "t", "src"])
+
+
+def _texts(txt: pl.DataFrame, df: pl.DataFrame) -> tuple[list[str], list[str]]:
     d = (df.select(["s1_uid", "rec_uid"])
          .join(txt.rename({"uid": "s1_uid", "t": "a"}).drop("src"), on="s1_uid", how="left", maintain_order="left")
          .join(txt.rename({"uid": "rec_uid", "t": "b"}), on="rec_uid", how="left", maintain_order="left"))
@@ -88,7 +92,7 @@ def train_half(cfg, half: int) -> None:
     cc = cfg.ce
     device = torch_device(cc.device)
     pairs = _training_pairs(cfg, half)
-    a, b = _texts(cfg, "train", pairs)
+    a, b = _texts(text_table(cfg, "train"), pairs)
     y = pairs["label"].to_numpy().astype(np.float32)
     log().info("  CE half %d: %d training pairs (%d pos)", half, len(y), int(y.sum()))
     tok, model = _load_model(cc.model_name, device)
@@ -129,44 +133,53 @@ def train_half(cfg, half: int) -> None:
     tok.save_pretrained(out)
 
 
-def _score(cfg, model_dir: Path, a: list[str], b: list[str]) -> np.ndarray:
-    import torch
+class _Scorer:
+    """A fine-tuned half model loaded once; scores text pairs in length-sorted batches."""
 
-    cc = cfg.ce
-    device = torch_device(cc.device)
-    tok, model = _load_model(str(model_dir), device)
-    model.eval()
-    order = np.argsort([len(x) + len(y) for x, y in zip(a, b)])
-    out = np.empty(len(a), dtype=np.float32)
-    bs = int(cc.infer_batch_size)
-    with torch.inference_mode():
-        for s in range(0, len(order), bs):
-            idx = order[s:s + bs]
-            enc = tok([a[i] for i in idx], [b[i] for i in idx], padding=True, truncation=True,
-                      max_length=int(cc.max_len), return_tensors="pt").to(device)
-            with torch.autocast(device_type=device.type, dtype=_amp_dtype(), enabled=device.type == "cuda"):
-                out[idx] = model(**enc).logits.view(-1).float().cpu().numpy()
-    return out
+    def __init__(self, cfg, model_dir: Path):
+        self.cc = cfg.ce
+        self.device = torch_device(self.cc.device)
+        self.tok, self.model = _load_model(str(model_dir), self.device)
+        self.model.eval()
+
+    def __call__(self, a: list[str], b: list[str]) -> np.ndarray:
+        import torch
+
+        order = np.argsort([len(x) + len(y) for x, y in zip(a, b)])
+        out = np.empty(len(a), dtype=np.float32)
+        bs = int(self.cc.infer_batch_size)
+        with torch.inference_mode():
+            for s in range(0, len(order), bs):
+                idx = order[s:s + bs]
+                enc = self.tok([a[i] for i in idx], [b[i] for i in idx], padding=True, truncation=True,
+                               max_length=int(self.cc.max_len), return_tensors="pt").to(self.device)
+                with torch.autocast(device_type=self.device.type, dtype=_amp_dtype(),
+                                    enabled=self.device.type == "cuda"):
+                    out[idx] = self.model(**enc).logits.view(-1).float().cpu().numpy()
+        return out
 
 
 def infer(cfg, split: str, shard: int = 0, nshards: int = 1) -> None:
+    """Score the uncertainty band in chunks (texts for one chunk at a time; each model loaded once)."""
     df = band(cfg, split)
     df = df.with_row_index("_i").filter(pl.col("_i") % nshards == shard).drop("_i")
-    a, b = _texts(cfg, split, df)
+    txt = text_table(cfg, split)
     mdir = work_dir(cfg, None, "models", "ce")
     halves = [list(h) for h in cfg.folds.neural_halves]
-    if split == "train":
-        fold = df["fold"].to_numpy() if "fold" in df.columns else \
-            df.join(pl.read_parquet(work_dir(cfg, "train", "s1.parquet"), columns=["s1_uid", "fold"]), on="s1_uid",
-                    how="left", maintain_order="left")["fold"].to_numpy()
-        ce = np.full(len(a), np.nan, dtype=np.float32)
-        for h in (0, 1):
-            m = ~np.isin(fold, halves[h])  # pairs this model never saw
-            if m.any():
-                sel = np.where(m)[0]
-                ce[sel] = _score(cfg, mdir / f"half{h}", [a[i] for i in sel], [b[i] for i in sel])
-    else:
-        ce = np.mean([_score(cfg, mdir / f"half{h}", a, b) for h in (0, 1)], axis=0)
+    scorers = [_Scorer(cfg, mdir / f"half{h}") for h in (0, 1)]
+    ce = np.full(df.height, np.nan, dtype=np.float32)
+    fold = df["fold"].to_numpy()
+    for s, e in chunks(df.height, int(cfg.ce.get("infer_chunk", 1_000_000))):
+        a, b = _texts(txt, df.slice(s, e - s))
+        if split == "train":
+            for h in (0, 1):
+                m = ~np.isin(fold[s:e], halves[h])  # pairs this model never saw
+                if m.any():
+                    sel = np.where(m)[0]
+                    ce[s + sel] = scorers[h]([a[i] for i in sel], [b[i] for i in sel])
+        else:
+            ce[s:e] = (scorers[0](a, b) + scorers[1](a, b)) / 2.0
+        log().info("   CE %s: %d/%d pairs scored", split, e, df.height)
     out = ensure_dir(work_dir(cfg, split, "preds"))
     df.select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(out / f"ce_part{shard:03d}.parquet")
     log().info("  CE %s shard %d/%d: scored %d pairs", split, shard, nshards, len(ce))

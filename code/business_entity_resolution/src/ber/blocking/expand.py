@@ -9,6 +9,8 @@ the train ceiling by at least ``min_gain``.
 """
 from __future__ import annotations
 
+import shutil
+
 import numpy as np
 import polars as pl
 
@@ -29,6 +31,9 @@ def _two_hop(pre: pl.DataFrame, cfg, split: str) -> pl.DataFrame:
     out = []
     for country in pre["country"].unique().to_list():
         vdir = work_dir(cfg, split, "vec", safe(country))
+        if not (vdir / "comb_rp.npy").exists():
+            raise FileNotFoundError(f"{vdir}/comb_rp.npy missing: 2-hop expansion needs blocking.save_vectors: true "
+                                    "(re-run the block stage) or set expand.enabled: false")
         uids = np.load(vdir / "uids.npy")
         C = np.load(vdir / "comb_rp.npy")
         sub = pre.filter(pl.col("country") == country)
@@ -75,6 +80,10 @@ def run_expand(cfg) -> None:
     mdir = work_dir(cfg, None, "models", "prerank")
     for split in (("test",) if inference_only(cfg) else ("train", "test")):
         cdir = work_dir(cfg, split, "cands")
+        if not ec.enabled:  # pre.parquet already carries hop2 = 0 and is sorted
+            shutil.copyfile(cdir / "pre.parquet", cdir / "final.parquet")
+            log().info("  %s: 2-hop expansion disabled; final candidates = pre-ranker selection", split)
+            continue
         pre = pl.read_parquet(cdir / "pre.parquet")
         use = False
         new = None

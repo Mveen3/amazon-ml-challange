@@ -65,22 +65,32 @@ def run_stage(cfg, stage: str, args) -> dict | None:
     elif stage == "block":
         import polars as pl
 
-        from ..blocking.candidates import block_split
+        from ..blocking.candidates import block_split, scan_union
         from ..eval.metric import ceiling
         info = {}
         for s in _splits(args):
-            union = block_split(cfg, s)
+            info[s] = block_split(cfg, s)
             if s == "train":
+                union = scan_union(cfg, "train", ["s1_uid", "rec_uid"]).collect()
                 truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet"))
                 s1 = pl.read_parquet(work_dir(cfg, "train", "s1.parquet"))
                 hit = union.join(truth, on=["s1_uid", "rec_uid"]).height
-                info = {"union_ceiling": ceiling(union, truth, s1), "pair_recall": hit / truth.height,
-                        "pairs_per_s1": union.height / s1.height}
-                log().info("  train union: %s", info)
+                info["train_summary"] = {"union_ceiling": ceiling(union, truth, s1),
+                                         "pair_recall": hit / max(1, truth.height),
+                                         "pairs_per_s1": union.height / s1.height}
+                log().info("  train union: %s", info["train_summary"])
+                del union
         return info
     elif stage == "prerank":
+        import shutil
+
+        from ..blocking.candidates import union_dir
         from ..blocking.prerank import run_prerank
         run_prerank(cfg)
+        if cfg.run.get("cleanup", False):  # the union files are only read by the pre-ranker
+            for s in _splits(args):
+                shutil.rmtree(union_dir(cfg, s), ignore_errors=True)
+            log().info("  cleanup: removed candidate-union files")
     elif stage == "expand":
         from ..blocking.expand import run_expand
         run_expand(cfg)

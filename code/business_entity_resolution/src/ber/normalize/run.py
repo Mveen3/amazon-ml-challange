@@ -1,6 +1,7 @@
 """Stage 0 driver: parse every record of a split into ``norm.parquet`` (parallel)."""
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import polars as pl
@@ -39,28 +40,27 @@ def parse_records(uids, names, addrs, profs, tables: Tables) -> pl.DataFrame:
 
 
 def _task(args) -> str:
-    out_path, uids, names, addrs, profs = args
-    parse_records(uids, names, addrs, profs, _TABLES).write_parquet(out_path)
+    out_path, rec_path, offset, length = args
+    part = (pl.scan_parquet(rec_path).slice(offset, length)
+            .select(["uid", "name_raw", "addr_raw", "prof"]).collect())
+    parse_records(part["uid"].to_list(), part["name_raw"].to_list(), part["addr_raw"].to_list(),
+                  part["prof"].to_list(), _TABLES).write_parquet(out_path)
     return out_path
 
 
 def normalize_split(cfg, split: str) -> None:
-    rec = pl.read_parquet(work_dir(cfg, split, "records.parquet"),
-                          columns=["uid", "name_raw", "addr_raw", "prof"])
-    tmp = ensure_dir(work_dir(cfg, split, "_norm_parts"))
+    """Workers read their own slice of records.parquet; parts are streamed into norm.parquet."""
+    rec_path = work_dir(cfg, split, "records.parquet")
+    n = pl.scan_parquet(rec_path).select(pl.len()).collect().item()
+    tmp = work_dir(cfg, split, "_norm_parts")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    ensure_dir(tmp)
     tables_path = work_dir(cfg, None, "tables.pkl")
-    size = int(cfg.normalize.chunk_size)
-    tasks = []
-    for i, (s, e) in enumerate(chunks(rec.height, size)):
-        part = rec.slice(s, e - s)
-        tasks.append((str(tmp / f"part_{i:05d}.parquet"), part["uid"].to_list(), part["name_raw"].to_list(),
-                      part["addr_raw"].to_list(), part["prof"].to_list()))
-    del rec
+    tasks = [(str(tmp / f"part_{i:05d}.parquet"), str(rec_path), s, e - s)
+             for i, (s, e) in enumerate(chunks(n, int(cfg.normalize.chunk_size)))]
     paths = pmap(_task, tasks, n_workers(cfg), initializer=_init,
                  initargs=(str(tables_path) if tables_path.exists() else None,), desc=f"normalize {split}")
-    norm = pl.concat([pl.read_parquet(p) for p in paths])
-    norm.write_parquet(work_dir(cfg, split, "norm.parquet"))
-    for p in paths:
-        Path(p).unlink()
-    tmp.rmdir()
-    log().info("  %s: normalized %d records", split, norm.height)
+    pl.scan_parquet(paths).sink_parquet(work_dir(cfg, split, "norm.parquet"))
+    shutil.rmtree(tmp)
+    log().info("  %s: normalized %d records", split, n)

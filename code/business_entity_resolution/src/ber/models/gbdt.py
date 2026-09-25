@@ -37,6 +37,7 @@ class GBDT:
         self.monotone = [1 if f in set(monotone or []) else 0 for f in self.features]
         self.seed = seed
         self.threads = threads
+        self.device = str(gcfg.get("device", "auto"))
         self.model = None
         self.best_iter = None
 
@@ -63,18 +64,22 @@ class GBDT:
             from ..utils import torch_device
 
             pp = self.params
+            max_bin = int(pp.get("max_bin", 255))
             p = {"objective": "binary:logistic", "eval_metric": "logloss", "tree_method": "hist",
                  "eta": pp.get("learning_rate", 0.05), "max_leaves": pp.get("num_leaves", 255),
                  "grow_policy": "lossguide", "max_depth": 0, "subsample": pp.get("bagging_fraction", 0.8),
                  "colsample_bytree": pp.get("feature_fraction", 0.8), "lambda": pp.get("lambda_l2", 1.0),
-                 "max_bin": pp.get("max_bin", 255), "seed": self.seed, "nthread": self.threads,
-                 "device": "cuda" if torch_device("auto").type == "cuda" else "cpu"}
+                 "max_bin": max_bin, "seed": self.seed, "nthread": max(1, self.threads),
+                 "device": self.device if self.device != "auto" else
+                 ("cuda" if torch_device("auto").type == "cuda" and xgb.build_info().get("USE_CUDA") else "cpu")}
             if any(self.monotone):
                 p["monotone_constraints"] = "(" + ",".join(map(str, self.monotone)) + ")"
-            dtr = xgb.DMatrix(X, y, feature_names=self.features, missing=np.nan)
+            # QuantileDMatrix: pre-binned, far less host/GPU memory than DMatrix
+            dtr = xgb.QuantileDMatrix(X, y, feature_names=self.features, missing=np.nan, max_bin=max_bin)
             evals = []
             if Xv is not None and len(Xv):
-                evals = [(xgb.DMatrix(Xv, yv, feature_names=self.features, missing=np.nan), "val")]
+                evals = [(xgb.QuantileDMatrix(Xv, yv, ref=dtr, feature_names=self.features, missing=np.nan,
+                                              max_bin=max_bin), "val")]
             self.model = xgb.train(p, dtr, self.rounds, evals=evals, verbose_eval=200,
                                    early_stopping_rounds=self.early_stop if evals else None)
             self.best_iter = getattr(self.model, "best_iteration", None)
@@ -131,11 +136,11 @@ def to_matrix(df, features: list[str]) -> np.ndarray:
     return df.select([pl.col(f).cast(pl.Float32) for f in features]).to_numpy()
 
 
-def train_oof(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray, gcfg, features: list[str],
-              out_dir: Path, seed: int = 42, threads: int = -1, monotone=None) -> tuple[np.ndarray, list[GBDT]]:
-    """Entity-grouped OOF training. Returns OOF predictions (NaN where fold == -1) and fold models."""
+def fit_folds(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray, gcfg, features: list[str],
+              out_dir: Path, seed: int = 42, threads: int = -1, monotone=None) -> list[GBDT]:
+    """One model per fold k, trained on rows whose entity fold != k (entity-grouped, early stopping on a
+    held-out slice of the *training* entities). ``models[k]`` never saw fold k, so it gives OOF scores."""
     rng = np.random.default_rng(seed)
-    oof = np.full(len(y), np.nan, dtype=np.float32)
     models = []
     for k in sorted(int(f) for f in np.unique(folds) if f >= 0):
         tr = folds != k
@@ -149,8 +154,6 @@ def train_oof(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray,
         log().info("   fold %d: fit %d rows (%d pos), val %d rows", k, fit_m.sum(), int(y[fit_m].sum()), val_m.sum())
         m = GBDT(gcfg, features, monotone=monotone, seed=seed + k, threads=threads)
         m.fit(X[fit_m], y[fit_m], X[val_m], y[val_m])
-        pred_m = folds == k
-        oof[pred_m] = m.predict(X[pred_m])
         m.save(Path(out_dir) / f"fold{k}")
         models.append(m)
     imp = {}
@@ -159,7 +162,14 @@ def train_oof(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray,
             imp[f] = imp.get(f, 0.0) + float(v)
     ensure_dir(Path(out_dir))
     (Path(out_dir) / "importance.json").write_text(json.dumps(dict(sorted(imp.items(), key=lambda x: -x[1])), indent=1))
-    return oof, models
+    return models
+
+
+def train_oof(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray, gcfg, features: list[str],
+              out_dir: Path, seed: int = 42, threads: int = -1, monotone=None) -> tuple[np.ndarray, list[GBDT]]:
+    """In-memory variant (small tables, e.g. the entity gate): fit fold models and return OOF predictions."""
+    models = fit_folds(X, y, folds, ents, gcfg, features, out_dir, seed, threads, monotone)
+    return predict_by_fold(models, X, folds), models
 
 
 def load_folds(out_dir: Path) -> list[GBDT]:

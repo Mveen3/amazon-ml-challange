@@ -17,15 +17,16 @@ from ..blocking.knn import topk
 from ..blocking.prerank import attach_norm
 from ..features import pair as P
 from ..models.gbdt import GBDT, to_matrix
+from ..models.stream import entities, load_rows, r1_paths, sample_entities
 from ..utils import log, n_workers, save_json, work_dir
 
 INTRINSIC = P.VEC_FEATURES + P.LOOP_FEATURES
 
 
 def run_s1s1(cfg) -> dict:
-    tr = P.load_r1(cfg, "train", columns=["s1_uid", "label"] + INTRINSIC)
-    if tr.height > int(cfg.s1s1.train_rows):
-        tr = tr.sample(int(cfg.s1s1.train_rows), seed=int(cfg.run.seed))
+    paths = r1_paths(cfg, "train")
+    sample = sample_entities(entities(paths), int(cfg.s1s1.train_entities), int(cfg.run.seed))
+    tr = load_rows(paths, ["s1_uid", "rec_uid", "label"] + INTRINSIC, sample)
     aux = GBDT(cfg.s1s1.gbdt, INTRINSIC, seed=int(cfg.run.seed), threads=n_workers(cfg))
     aux.fit(to_matrix(tr, INTRINSIC), tr["label"].to_numpy())
     res = {}
@@ -37,6 +38,9 @@ def run_s1s1(cfg) -> dict:
                 {"ngram": list(cfg.blocking.ngram), "hash_features": int(cfg.blocking.hash_features)})
         for country in rec["country"].unique().to_list():
             vdir = work_dir(cfg, split, "vec", safe(country))
+            if not (vdir / "comb_rp.npy").exists():
+                raise FileNotFoundError(f"{vdir}/comb_rp.npy missing: the S1<->S1 diagnostic needs "
+                                        "blocking.save_vectors: true (re-run the block stage)")
             uids = np.load(vdir / "uids.npy")
             C = np.load(vdir / "comb_rp.npy")
             src = rec["src"].to_numpy()[uids]

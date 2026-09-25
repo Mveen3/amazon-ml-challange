@@ -1,0 +1,10 @@
+# Extra packages for a Kaggle notebook. Kaggle's image already ships torch (CUDA), transformers,
+# numpy, scipy, scikit-learn, pyarrow, xgboost and lightgbm; pip only installs what is missing or
+# older than these minimums (no -U, so the preinstalled CUDA stack is left alone).
+# requirements.txt remains the pinned reference environment.
+polars>=1.25
+rapidfuzz>=3.6
+PyYAML>=6.0
+xgboost>=2.0
+scikit-learn>=1.3
+transformers>=4.40

@@ -17,7 +17,7 @@ from ..features.consensus import R2_EXTRA
 from ..features.context import context_names, score_context
 from ..models.calibrate import Calibrator
 from ..models.gate import ownership, rescore_gate
-from ..models.rounds import r2_frame, rescore_r2
+from ..models.rounds import R2_OUT, score_r2
 from ..decision.select import build_arrays
 from ..utils import log, save_json, work_dir
 
@@ -63,12 +63,10 @@ def simulate(cfg) -> dict:
     extras = extras.filter(~pl.col("s1_uid").is_in(drop.implode()))
     c1 = context_names("c1")
     extras = score_context(extras.drop(c1), "p1", "c1")  # competition recomputed without the dropped S1s
-    df, feats = r2_frame(cfg, "train", extras.select(["s1_uid", "rec_uid"] + R2_EXTRA))
-    p2 = rescore_r2(cfg, df, feats)
+    pr = score_r2(cfg, "train", extras.select(["s1_uid", "rec_uid"] + R2_EXTRA))  # dropped S1 rows fall out
     cal = Calibrator.load(work_dir(cfg, None, "models", "r2", "calibrator.pkl"))
-    prof = df["prof"].to_numpy()
-    r2 = df.select(["s1_uid", "rec_uid", "fold", "prof", "label", "src", "nm_tset", "ad_tset", "num_hit"]).with_columns(
-        [pl.Series("p2", p2), pl.Series("q", cal.transform(p2, prof))])
+    p2 = pr["pred"].to_numpy()
+    r2 = pr.select(R2_OUT).with_columns([pl.Series("p2", p2), pl.Series("q", cal.transform(p2, pr["prof"].to_numpy()))])
     gate = rescore_gate(cfg, "train", r2).filter(~pl.col("s1_uid").is_in(drop.implode()))
     log().info("  stress simulate: %d S1 kept, %d pairs", gate.height, r2.height)
     return build_arrays(ownership(r2.sort(["s1_uid", "rec_uid"])), gate.sort("s1_uid"), int(cfg.decision.max_members))

@@ -1,7 +1,7 @@
 """Stage 2 round-1 pair features (sharded, multiprocess).
 
 Main process: context features over the final candidate graph, join both sides'
-parsed fields, write one input shard per (country, s1_uid % n_shards).
+parsed fields, write input shards of ``shard_rows`` pairs (contiguous S1 ranges, per country).
 Workers: vectorised rapidfuzz similarities + exact TF-IDF cosines + a per-pair
 Python pass for token/IDF, component, number, domain, legal and diff-signature
 features. Output: ``feats/r1/*.parquet``.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import pickle
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -18,13 +19,13 @@ from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler, Levenshtein
 from rapidfuzz.process import cdist, cpdist
 
-from ..blocking.candidates import safe
+from ..blocking.candidates import countries, safe
 from ..blocking.prerank import PRE_FEATURES, attach_norm
 from ..blocking.vectors import tfidf_rows
 from ..normalize.profiles import ALL_LEGAL_TOKENS, LEGAL_FAMILY
 from ..normalize.tables import Tables
 from ..normalize.translit import skeleton
-from ..utils import ensure_dir, log, n_workers, pmap, work_dir
+from ..utils import chunks, ensure_dir, log, n_workers, pmap, work_dir
 from . import diffsig
 from .context import context_names, score_context
 
@@ -56,12 +57,12 @@ NAN = float("nan")
 
 # ----------------------------------------------------------------------------- idf tables
 def build_token_idf(cfg, split: str) -> None:
-    rec = pl.read_parquet(work_dir(cfg, split, "records.parquet"), columns=["uid", "country"])
-    norm = pl.read_parquet(work_dir(cfg, split, "norm.parquet"), columns=["uid", "name_core", "addr_tokens"])
-    df = rec.join(norm, on="uid")
     rare_df = int(cfg.features.rare_df)
-    for country in df["country"].unique().to_list():
-        sub = df.filter(pl.col("country") == country)
+    for country in countries(cfg, split):
+        sub = (pl.scan_parquet(work_dir(cfg, split, "records.parquet")).select(["uid", "country"])
+               .filter(pl.col("country") == country)
+               .join(pl.scan_parquet(work_dir(cfg, split, "norm.parquet")).select(["uid", "name_core", "addr_tokens"]),
+                     on="uid").collect())
         n = sub.height
         out = {}
         for field, expr in (("name", pl.col("name_core").str.split(" ")), ("addr", pl.col("addr_tokens"))):
@@ -74,31 +75,35 @@ def build_token_idf(cfg, split: str) -> None:
             out[f"{field}_rare"] = float(math.log((n + 1) / (rare_df + 1)) + 1)
         with open(work_dir(cfg, split, f"tokidf_{safe(country)}.pkl"), "wb") as f:
             pickle.dump(out, f)
+        del sub, out
 
 
 # ----------------------------------------------------------------------------- inputs
-def build_inputs(cfg, split: str, pairs: pl.DataFrame) -> list[tuple[str, str]]:
-    """Write joined input shards; return (in_path, out_path) tasks."""
-    n_shards = int(cfg.features.n_shards)
-    s1 = pl.read_parquet(work_dir(cfg, split, "s1.parquet"), columns=["s1_uid", "prof", "fold"])
-    pairs = pairs.drop([c for c in ("fold", "prof") if c in pairs.columns]).join(s1, on="s1_uid", how="left")
-    if split == "train":
-        truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
-        pairs = pairs.join(truth, on=["s1_uid", "rec_uid"], how="left").with_columns(pl.col("label").fill_null(0))
-    else:
-        pairs = pairs.with_columns(pl.lit(None, dtype=pl.Int8).alias("label"))
-    norm = pl.read_parquet(work_dir(cfg, split, "norm.parquet"), columns=["uid"] + NORM_COLS)
-    in_dir = ensure_dir(work_dir(cfg, split, "feats", "r1_in"))
-    out_dir = ensure_dir(work_dir(cfg, split, "feats", "r1"))
-    tasks = []
-    for country in sorted(pairs["country"].unique().to_list()):
-        sub = attach_norm(pairs.filter(pl.col("country") == country), norm, NORM_COLS)
-        sub = sub.with_columns((pl.col("s1_uid") % n_shards).alias("_shard"))
-        for key, g in sub.partition_by("_shard", as_dict=True).items():
-            sh = key[0] if isinstance(key, tuple) else key
-            name = f"{safe(country)}_{int(sh):04d}.parquet"
-            g.drop("_shard").write_parquet(in_dir / name)
+def _labelled(pairs: pl.DataFrame, s1: pl.DataFrame, truth: pl.DataFrame | None) -> pl.DataFrame:
+    pairs = pairs.drop([c for c in ("fold", "prof", "label") if c in pairs.columns]).join(s1, on="s1_uid", how="left")
+    if truth is not None:
+        return pairs.join(truth, on=["s1_uid", "rec_uid"], how="left").with_columns(pl.col("label").fill_null(0))
+    return pairs.with_columns(pl.lit(None, dtype=pl.Int8).alias("label"))
+
+
+def write_shards(cfg, country: str, pairs: pl.DataFrame, norm: pl.DataFrame, in_dir: Path,
+                 out_dir: Path) -> list[tuple[str, str]]:
+    """Join both sides' parsed fields in ``join_rows`` chunks and cut ``shard_rows`` input shards.
+
+    ``pairs`` is sorted by (s1_uid, rec_uid), so every shard covers a contiguous S1 range.
+    """
+    fc = cfg.features
+    need = pl.concat([pairs.select(pl.col("s1_uid").alias("uid")), pairs.select(pl.col("rec_uid").alias("uid"))]).unique()
+    norm_c = norm.join(need, on="uid", how="semi")
+    tasks, idx = [], 0
+    for s, e in chunks(pairs.height, int(fc.get("join_rows", 4_000_000))):
+        joined = attach_norm(pairs.slice(s, e - s), norm_c, NORM_COLS)
+        for s2, e2 in chunks(joined.height, int(fc.get("shard_rows", 500_000))):
+            name = f"{safe(country)}_{idx:05d}.parquet"
+            joined.slice(s2, e2 - s2).write_parquet(in_dir / name)
             tasks.append((str(in_dir / name), str(out_dir / name)))
+            idx += 1
+        del joined
     return tasks
 
 
@@ -274,13 +279,31 @@ def _task(args) -> str:
 # ----------------------------------------------------------------------------- driver
 def run_features(cfg, split: str) -> None:
     build_token_idf(cfg, split)
-    final = pl.read_parquet(work_dir(cfg, split, "cands", "final.parquet"))
-    final = score_context(final.sort(["s1_uid", "rec_uid"]), "p_pre", "pre")
-    tasks = build_inputs(cfg, split, final)
-    del final
+    in_dir, out_dir = work_dir(cfg, split, "feats", "r1_in"), work_dir(cfg, split, "feats", "r1")
+    for d in (in_dir, out_dir):  # never mix shards from an earlier run
+        if d.exists():
+            shutil.rmtree(d)
+        ensure_dir(d)
+    s1 = pl.read_parquet(work_dir(cfg, split, "s1.parquet"), columns=["s1_uid", "prof", "fold"])
+    truth = None
+    if split == "train":
+        truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
+    norm = pl.read_parquet(work_dir(cfg, split, "norm.parquet"), columns=["uid"] + NORM_COLS)
+    final = work_dir(cfg, split, "cands", "final.parquet")
+    tasks = []
+    for country in countries(cfg, split):  # pairs never cross countries -> context per country is exact
+        pairs = pl.scan_parquet(final).filter(pl.col("country") == country).collect().sort(["s1_uid", "rec_uid"])
+        if pairs.height == 0:
+            continue
+        pairs = _labelled(score_context(pairs, "p_pre", "pre"), s1, truth)
+        tasks += write_shards(cfg, country, pairs, norm, in_dir, out_dir)
+        del pairs
+    del norm
     cf = {"ngram": list(cfg.blocking.ngram), "hash_features": int(cfg.blocking.hash_features)}
     pmap(_task, tasks, n_workers(cfg), initializer=_init,
          initargs=(str(work_dir(cfg, split)), str(work_dir(cfg, None, "tables.pkl")), cf), desc=f"r1 feats {split}")
+    if in_dir.exists() and not any(in_dir.iterdir()):  # workers delete inputs as they finish
+        in_dir.rmdir()
     log().info("  %s: %d feature shards", split, len(tasks))
 
 

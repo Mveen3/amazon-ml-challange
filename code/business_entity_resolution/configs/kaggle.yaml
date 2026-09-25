@@ -1,0 +1,60 @@
+# Kaggle notebook profile: 2x T4 (15 GB each), 4 CPU cores, ~29 GB RAM, 12 h per session,
+# 20 GB saved under /kaggle/working. Used by kaggle/amazon_ml_kaggle.ipynb, which also sets
+# paths.work_dir (scratch disk), paths.data_dir (linked competition files) and paths.output_dir.
+# Every value here only trades scale for memory/time; the pipeline code is identical to default.yaml.
+inherit: default.yaml
+
+paths:
+  work_dir: /kaggle/temp/ber_work    # scratch disk, outside the 20 GB /kaggle/working quota
+
+run:
+  cleanup: true                      # drop the candidate-union files once the pre-ranker has consumed them
+
+folds:
+  n_folds: 4                         # 4 fold models per GBDT instead of 5 (time)
+  neural_halves: [[0, 1], [2, 3]]
+
+normalize: {chunk_size: 50000}
+mining: {max_pairs: 1500000}
+
+blocking:
+  rp_dim: 128                        # halves vector memory; recall impact is small
+  vector_chunk: 100000
+  save_vectors: false                # ~20 GB of vectors would not fit; only 2-hop / S1<->S1 need them
+  knn: {device: auto, mem_gb: 3.0}   # T4: 15 GB, index + query chunks stay well below
+  a1: {k_fwd: 30, k_rev: 3}
+  n1: {k_fwd: 20, k_rev: 3}
+
+prerank:
+  sample_entities: 400000
+  chunk_rows: 3000000
+  gbdt: {backend: xgboost, device: auto, max_entities: 400000, rounds: 600}
+
+expand: {enabled: false}             # needs saved vectors; gave no gain on the sample
+
+features:
+  shard_rows: 300000
+  join_rows: 1500000
+
+r1:
+  sample_entities: 500000
+  gbdt: {backend: xgboost, device: auto, max_entities: 500000, rounds: 2000}
+
+ce:
+  enabled: true
+  model_name: intfloat/multilingual-e5-small   # MIT, 118M params: fits the time budget on 2x T4 (fp16)
+  device: auto
+  batch_size: 128
+  infer_batch_size: 1024
+  max_pos: 300000
+  band: [0.05, 0.95]
+  top_rank: 2
+  infer_chunk: 500000
+
+r2:
+  sample_entities: 500000
+  chunk_s1: 100000
+  gbdt: {backend: xgboost, device: auto, max_entities: 500000, rounds: 2000}
+
+gate:
+  gbdt: {backend: xgboost, device: auto}

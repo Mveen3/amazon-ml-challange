@@ -674,6 +674,25 @@ Supporting libraries (all permissively licensed): polars, pyarrow, rapidfuzz, nu
 
 ---
 
+### 14.1 Kaggle profile (added 25 Sep)
+
+The pipeline also runs as a Kaggle notebook: `code/business_entity_resolution/kaggle/amazon_ml_kaggle.ipynb` with `configs/kaggle.yaml`. The machine has 2× T4 (15 GB each), 4 CPU cores, about 29 GB RAM, 12-hour sessions and 20 GB of saved output.
+
+To fit, every stage streams:
+- Candidates are written per country.
+- The pre-ranker scores them in chunks and keeps only pairs that some floor in the grid could select. This is exact, because `_select` only ever ranks pairs above the lowest floor.
+- Feature shards cover contiguous S1 ranges.
+- Each GBDT trains on the rows of a random sample of whole entities, then scores every pair shard by shard. Train rows are scored out-of-fold.
+
+Kaggle-specific settings:
+- 4 folds.
+- XGBoost on the GPU.
+- 128-d projections.
+- No saved vectors, and therefore no 2-hop expansion.
+- A smaller cross-encoder (`intfloat/multilingual-e5-small`, MIT) running fp16 on both T4s.
+
+Full-scale runtime on Kaggle is not yet measured. The notebook reports the session time used after every stage, and has time valves: switch off the cross-encoder, or subsample the train clusters.
+
 ## 15. Timeline (IST)
 
 Workstreams: **A** = data, blocking and features (critical path, CPU box). **B** = neural (GPU box). **C** = validation, decision and submissions. If working solo, A and C come first, and B runs in the background.
@@ -752,6 +771,7 @@ Extra stages: `s1s1` and `stress_check`.
 | XGBoost fallback | **Run** (fit, save, reload, identical predictions) |
 | Cross-encoder and bi-encoder | **Plumbing verified with a stub model** (training loop, cross-fitting, band, sharded inference, round-2 integration). Not yet run with the real Hugging Face weights, because the local environment has `transformers` 2.1.1. Run it on the AWS box with the pinned `transformers==4.46.3`. |
 | Full-scale runtime and memory | **Not yet measured.** Sizing in §14 and the README is estimated. |
+| Streaming refactor + Kaggle profile (§14.1) | **Run end to end** on the sample under `configs/kaggle.yaml`: dataset locator on a packed zip, 4-fold XGBoost, packaging with scratch-disk overrides, inference-only reproduction (byte-identical). Two from-scratch runs are still byte-identical. Not yet run on Kaggle itself. |
 
 ## 17. Risks and fallbacks
 
