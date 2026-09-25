@@ -50,6 +50,12 @@ class KaggleRun:
         self.heartbeat_s = 300                # seconds between automatic progress reports while a stage runs
         self.session_limit_h = 12.0
         self._last_line = ""
+        self._gpu: dict[str, dict] = {}       # per-GPU utilisation samples since the last report
+        try:
+            import psutil
+            psutil.cpu_percent(interval=None)  # prime: later calls report the average since the previous call
+        except ImportError:
+            pass
         self._run_started = time.time()
         if str(self.pkg / "src") not in sys.path:  # only for ber.progress / ber.config in this process
             sys.path.insert(0, str(self.pkg / "src"))
@@ -151,6 +157,36 @@ class KaggleRun:
             sets.append("checkpoint.enabled=false")
         return sets
 
+    def _sample_gpus(self) -> None:
+        """One nvidia-smi reading per GPU, accumulated until the next report (a single snapshot can miss a busy GPU)."""
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.strip().splitlines():
+                i, util, used, total = [x.strip() for x in line.split(",")]
+                g = self._gpu.setdefault(i, {"util": [], "mem": 0.0, "total": float(total)})
+                g["util"].append(float(util))
+                g["mem"] = max(g["mem"], float(used))
+        except Exception:
+            pass
+
+    def resources(self) -> str:
+        """'GPU0 avg 61% peak 100% mem 9.8/15 GB | GPU1 ... | CPU 92% | RAM 14/34 GB' since the last report."""
+        parts = []
+        for i, g in sorted(self._gpu.items()):
+            if g["util"]:
+                parts.append(f"GPU{i} avg {sum(g['util']) / len(g['util']):.0f}% peak {max(g['util']):.0f}% "
+                             f"mem {g['mem'] / 1024:.1f}/{g['total'] / 1024:.0f} GB")
+        self._gpu = {}
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            parts.append(f"CPU {psutil.cpu_percent(interval=None):.0f}%")
+            parts.append(f"RAM {vm.used / 1e9:.1f}/{vm.total / 1e9:.0f} GB")
+        except ImportError:
+            pass
+        return " | ".join(parts)
+
     def status(self, sets: list[str] | None = None, activity: bool = False) -> None:
         """Print the pipeline + session progress bars (elapsed, remaining, projected finish)."""
         try:
@@ -166,12 +202,21 @@ class KaggleRun:
             lines = [f"(progress unavailable: {type(e).__name__}: {e})"]
         stamp = time.strftime("%H:%M:%S")
         print(f"\n[{stamp}] " + "\n           ".join(lines), flush=True)
-        if activity and self._last_line:
-            print(f"           last log line: {self._last_line[:110]}", flush=True)
+        if activity:
+            res = self.resources()
+            if res:
+                print(f"           RESOURCES {res} (since the last report)", flush=True)
+            if self._last_line:
+                print(f"           last log line: {self._last_line[:110]}", flush=True)
 
     def _heartbeat(self, stop: threading.Event, sets: list[str]) -> None:
-        while not stop.wait(self.heartbeat_s):
-            self.status(sets, activity=True)
+        tick = max(1.0, min(5.0, self.heartbeat_s / 2))
+        next_beat = time.time() + self.heartbeat_s
+        while not stop.wait(tick):
+            self._sample_gpus()
+            if time.time() >= next_beat:
+                self.status(sets, activity=True)
+                next_beat = time.time() + self.heartbeat_s
 
     def run(self, stages: str, sets: list[str], log_name: str = "pipeline.log", fresh: bool = False) -> None:
         cmd = [sys.executable, "-u", "-m", "ber.pipeline.run", "--config", self.config, "--stage", stages]

@@ -144,13 +144,35 @@ Only scale and speed settings change; the code path is the same as on AWS.
 |---|---|---|
 | Folds | 4 instead of 5 | Time |
 | GBDT | XGBoost on GPU instead of LightGBM on CPU | Kaggle has only 4 CPU cores |
-| Random projections | 128-d instead of 256-d; fewer kNN neighbours | Memory |
+| Random projections / kNN | 192-d instead of 256-d; neighbours 30/3 and 20/3 instead of 50/5 and 30/5 | RAM and time: 40% fewer candidates to score (§4.4.1) |
 | Exact-key blocks | At most 50 S1 and 5,000 pairs per block (instead of 200 and 20,000) | Memory. Measured on the full US train data: larger blocks are generic names that add only look-alikes. |
 | Model training | Sample of 500k entities | Memory. Every pair is still scored. |
 | 2-hop expansion | On, but self-gated: decided on a 250k-entity probe, run on everything only if it raises the candidate ceiling by ≥ 0.0005 | Costs minutes if it does not help; never lowers accuracy when it does not help (§4.3.2) |
 | Projection vectors | Saved to the scratch disk (~10 GB of the 1.2 TB), not checkpointed; rebuilt on demand | 2-hop needs them |
 | Cross-encoder | `intfloat/multilingual-e5-small` (MIT, 118M parameters) on both T4s, fp16 | Time |
 | Work files | On the scratch disk, not the 20 GB `/kaggle/working` | Disk |
+
+### 4.4.1 Accuracy: Kaggle configuration vs the AWS configuration
+There **is** a difference. Some settings were reduced to fit the time and memory of a Kaggle session. What was measured and what was not:
+
+**Measured** (18,000 train entities, identical data; "ceiling" = best achievable macro F0.5 of the candidate set, which no later stage can exceed):
+
+| Blocking settings | Ceiling | Pairs/S1 |
+|---|---|---|
+| AWS defaults (256-d, k 50/5 and 30/5) | 0.99954 | 95 |
+| Kaggle before 26 Sep (128-d, k 30/3 and 20/3) | 0.99912 | 57 |
+| **Kaggle now (192-d, k 30/3 and 20/3)** | **0.99935** | **57** |
+| 256-d, same k (not used: ~25 GB RAM at full scale) | 0.99941 | 57 |
+| 192-d + reverse-k back to 5 (not used) | 0.99937 | 70 |
+
+- At full scale the loss is likely larger, because more look-alike records compete for the same neighbours. Measured: −0.00019 at 3k entities and −0.00042 at 18k, so it grows with size. A rough extrapolation says a few tenths of a point at 2.2M entities. That is an upper bound on the score impact.
+- **What to watch in the real run:** the `train union: {'union_ceiling': ...}` log line after `block`. If it is below about 0.995, raise the neighbour counts (`blocking.a1/n1.k_fwd`) at the cost of more scoring time.
+- The tighter exact-key block caps (50 S1 / 5,000 pairs instead of 200 / 20,000) had no effect at 18k entities. On the real US train data, 3.0% of true pairs sit in name-key blocks that the tighter caps drop. Almost all are still found through the address channels; the rest (missing address) are ambiguous among 50-200 same-name entities anyway.
+
+**Not measured** (they need the real data or GPUs I do not have; each is expected to cost little, none can raise the score):
+- **Cross-encoder:** `multilingual-e5-small` (118M, not a reranker) trained on up to 300k positives, instead of `bge-reranker-v2-m3` (568M, a pretrained multilingual reranker) on 1.5M. This is the largest deliberate downgrade of the neural part. It is only one input to round 2.
+- **GBDT:** XGBoost on GPU instead of LightGBM; 4 folds instead of 5; training on 500k entities (400k for the pre-ranker) instead of 800k (600k). On the 5k sample the two setups scored within noise of each other.
+- **Lookup tables** are mined from 1.5M pairs instead of 3M, so a few rare transliteration entries may fall below the support threshold.
 
 ### 4.5 If the 12-hour limit is tight
 Full-scale runtime on Kaggle has **not been measured**. The notebook prints the session time used after every stage. To shorten a run:

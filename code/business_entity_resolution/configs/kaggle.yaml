@@ -21,7 +21,9 @@ normalize: {chunk_size: 50000}
 mining: {max_pairs: 1500000}
 
 blocking:
-  rp_dim: 128                        # halves vector memory; recall impact is small
+  rp_dim: 192                        # measured (18k entities): 128-d loses 0.00013 of candidate ceiling, 192-d recovers
+                                     # ~half of the Kaggle blocking loss at zero extra candidates; 256-d would push the
+                                     # US-train block stage to ~25 GB RAM, so 192 keeps a safe margin
   vector_chunk: 100000
   save_vectors: true                 # 2-hop expansion + S1<->S1 diagnostic read them. ~10 GB on the 1.2 TB scratch disk;
                                      # not checkpointed to Hugging Face (rebuilt on demand, see ensure_vectors)

@@ -46,6 +46,9 @@ def _proj_task(args):
 
 
 def random_matrix(path: Path, n_features: int, dim: int, seed: int) -> Path:
+    """Seeded Gaussian projection matrix; regenerated if a file of another shape is left over from an earlier config."""
+    if path.exists() and np.load(path, mmap_mode="r").shape != (int(n_features), int(dim)):
+        path.unlink()
     if not path.exists():
         rng = np.random.default_rng(seed)
         R = rng.standard_normal((int(n_features), int(dim)), dtype=np.float32) / np.sqrt(dim)

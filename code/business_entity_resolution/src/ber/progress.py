@@ -6,7 +6,7 @@ those into two bars:
     PIPELINE  ████████████░░░░░░░░░░░░  48%  stage 8/16: features | worked 2h05m | remaining ~2h10m (estimate)
     SESSION   ██████░░░░░░░░░░░░░░░░░░  27%  of the 12h limit used (3h14m) | 8h46m left | pipeline projected to end at ~5h24m
 
-Estimates: every stage has a rough relative weight (minutes on a 4-core / 2xT4 box). Once stages have finished, the
+Estimates: every stage has a rough relative weight (minutes on the Kaggle box). Once stages have finished, the
 weights are rescaled by how long they really took (clamped to 0.25x-6x), so the estimate improves as the run goes on.
 The stage that is running is assumed to be no more than 95% done, and never to have less than 20% of its estimate left.
 The session bar only appears when ``BER_SESSION_LIMIT_H`` is set (the Kaggle runner sets it, together with
@@ -23,10 +23,13 @@ ORDER = ["ingest", "eda", "mine", "normalize", "dense", "block", "prerank", "exp
          "ce_train", "ce_infer", "r2", "gate", "tune", "predict", "outputs"]
 TRAIN_ONLY = {"eda", "mine", "ce_train", "tune"}
 
-# rough full-scale minutes (4 cores, 2x T4); only the ratios matter
-MINUTES = {"ingest": 3, "eda": 1, "mine": 8, "normalize": 10, "dense": 30, "block": 50, "prerank": 60, "expand": 12,
-           "features": 40, "r1": 15, "ce_train": 20, "ce_infer": 40, "r2": 20, "gate": 3, "tune": 8, "predict": 2,
-           "outputs": 5}
+# Rough full-scale minutes on Kaggle (4 slow CPU cores, 2x T4); only the ratios matter. Recalibrated on 26 Sep from a
+# measured Kaggle log (a Kaggle core is ~4x slower than a laptop core on this Python-heavy work): normalize ~17 min
+# (24M records), features ~55 min (~16M pairs at ~0.7 ms/pair/core), block and prerank dominated by 100M+-pair GPU
+# kNN and rapidfuzz scoring, XGBoost stages ~30-40 min each.
+MINUTES = {"ingest": 3, "eda": 1, "mine": 8, "normalize": 17, "dense": 30, "block": 85, "prerank": 75, "expand": 15,
+           "features": 55, "r1": 30, "ce_train": 30, "ce_infer": 45, "r2": 40, "gate": 5, "tune": 10, "predict": 3,
+           "outputs": 8}
 
 
 def plan(ce_enabled: bool = True, expand_enabled: bool = True, dense_enabled: bool = False,
