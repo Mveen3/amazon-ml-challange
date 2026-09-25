@@ -27,6 +27,10 @@ blocking:
   knn: {device: auto, mem_gb: 3.0}   # T4: 15 GB, index + query chunks stay well below
   a1: {k_fwd: 30, k_rev: 3}
   n1: {k_fwd: 20, k_rev: 3}
+  # Exact-key blocks: measured on the full US train data, blocks with >50 S1 or >5000 pairs are generic-name
+  # blocks ("Primary Care Group") that add look-alikes only (name key: 16.1 -> 7.2 pairs/S1); those matches are
+  # still found by the address / name+address kNN channels. Keeps the block stage well inside Kaggle's RAM.
+  keyblock: {max_block_s1: 50, max_block_pairs: 5000}
 
 prerank:
   sample_entities: 400000

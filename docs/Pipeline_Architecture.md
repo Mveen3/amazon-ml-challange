@@ -697,6 +697,8 @@ Full-scale runtime on Kaggle is not yet measured. The notebook reports the sessi
 
 **T4 precision.** On a T4, `torch.cuda.is_bf16_supported()` returns True through emulation. So mixed precision is chosen by compute capability: bf16 only on Ampere or newer, otherwise fp16 with gradient scaling.
 
+**Key-block caps and memory order (26 Sep).** The 5k-entity sample cannot show how exact-key blocks grow at full scale, so this was measured on the raw US train data (1.32M S1). Under the default caps (≤200 S1, ≤20,000 pairs per block), the exact-name key alone adds 16.1 pairs per S1, and 83% of them come from about 9k generic-name blocks. Kaggle therefore uses ≤50 S1 and ≤5,000 pairs per block, giving 7.2 pairs per S1. The block stage now also computes key pairs before the vectors, and frees the partition and the kNN/key tables as early as possible. Its output is byte-identical to before.
+
 **Multi-GPU.** The cross-encoder is wrapped so that DataParallel gathers plain logit tensors. This removes any dependence on how a given transformers version structures its model outputs (Kaggle ships transformers 5.x).
 
 ## 15. Timeline (IST)

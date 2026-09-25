@@ -72,7 +72,7 @@ def build(docs: list[str], out_dir: Path, field: str, cfg, workers: int) -> np.n
     return np.concatenate(parts, axis=0) if parts else np.zeros((0, dim), np.float16)
 
 
-def rowwise_cos(A: np.ndarray, B: np.ndarray, ia: np.ndarray, ib: np.ndarray, batch: int = 2_000_000) -> np.ndarray:
+def rowwise_cos(A: np.ndarray, B: np.ndarray, ia: np.ndarray, ib: np.ndarray, batch: int = 500_000) -> np.ndarray:
     """cos(A[ia[k]], B[ib[k]]) for all k (vectors already L2-normalised)."""
     out = np.empty(len(ia), dtype=np.float32)
     for s, e in chunks(len(ia), batch):

@@ -129,6 +129,7 @@ Only scale and speed settings change; the code path is the same as on AWS.
 | Folds | 4 instead of 5 | Time |
 | GBDT | XGBoost on GPU instead of LightGBM on CPU | Kaggle has only 4 CPU cores |
 | Random projections | 128-d instead of 256-d; fewer kNN neighbours | Memory |
+| Exact-key blocks | At most 50 S1 and 5,000 pairs per block (instead of 200 and 20,000) | Memory. Measured on the full US train data: larger blocks are generic names that add only look-alikes. |
 | Model training | Sample of 500k entities | Memory. Every pair is still scored. |
 | Saved vectors / 2-hop expansion | Off | Disk |
 | Cross-encoder | `intfloat/multilingual-e5-small` (MIT, 118M parameters) on both T4s, fp16 | Time |

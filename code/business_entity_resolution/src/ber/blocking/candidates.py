@@ -102,17 +102,29 @@ def block_split(cfg, split: str) -> dict:
         shutil.rmtree(udir)
     ensure_dir(udir)
     info = {}
+    bits = {i: 1 << i for i in range(len(K.KEY_TYPES))}
     for country in countries(cfg, split):
+        # Memory order matters at full scale: the exact-key pairs are computed and aggregated while the
+        # partition is the only big object; the partition is dropped before the vectors are built; the
+        # kNN / key tables are dropped before the RP cosines. Peak = max of these phases, not their sum.
         part = load_country(cfg, split, country)
         uids = part["uid"].to_numpy()
         src = part["src"].to_numpy()
         has_addr = ~part["addr_missing"].to_numpy()
         log().info("  [%s/%s] %d records (%d S1)", split, country, len(uids), int((src == 1).sum()))
+        kagg = (K.key_pairs(K.make_keys(part, cfg), cfg)
+                .with_columns(pl.col("kt").replace_strict(bits, return_dtype=pl.Int32).alias("bit"))
+                .group_by(["s1_uid", "rec_uid"])
+                .agg([pl.col("bit").unique().sum().alias("key_mask"), pl.col("block").min().alias("key_block"),
+                      pl.col("kt").n_unique().cast(pl.Int8).alias("key_n")]))
+        gc.collect()
         vdir = ensure_dir(work_dir(cfg, split, "vec", safe(country)))
         addr_docs = part["addr_latin"].str.replace_all(",", " ").to_list()
         name_docs = pl.when(pl.col("name_core").str.len_chars() > 0).then(pl.col("name_core")) \
             .otherwise(pl.col("name_latin"))
         name_docs = part.select(name_docs.alias("d"))["d"].to_list()
+        del part
+        gc.collect()
         A = build(addr_docs, vdir, "addr", cfg, workers)
         N = build(name_docs, vdir, "name", cfg, workers)
         del addr_docs, name_docs
@@ -133,6 +145,7 @@ def block_split(cfg, split: str) -> dict:
         if bc.get("dense", {}).get("enabled", False) and dense_path.exists():
             hits.append(pl.read_parquet(dense_path))
         knn = pl.concat(hits)
+        del hits
         aggs = []
         for name, code in CHANNELS.items():
             aggs.append(pl.col("rank").filter(pl.col("ch") == code).min().alias(f"{name}_rank"))
@@ -140,26 +153,21 @@ def block_split(cfg, split: str) -> dict:
                  pl.col("sim").filter(pl.col("ch").is_in([2, 3])).max().alias("n1_sim"),
                  pl.col("sim").filter(pl.col("ch").is_in([4, 5])).max().alias("d1_sim")]
         knn = knn.group_by(["s1_uid", "rec_uid"]).agg(aggs)
-        del hits
-
-        kp = K.key_pairs(K.make_keys(part, cfg), cfg)
-        del part
-        bits = {i: 1 << i for i in range(len(K.KEY_TYPES))}
-        kagg = (kp.with_columns(pl.col("kt").replace_strict(bits, return_dtype=pl.Int32).alias("bit"))
-                .group_by(["s1_uid", "rec_uid"])
-                .agg([pl.col("bit").unique().sum().alias("key_mask"), pl.col("block").min().alias("key_block"),
-                      pl.col("kt").n_unique().cast(pl.Int8).alias("key_n")]))
         union = knn.join(kagg, on=["s1_uid", "rec_uid"], how="full", coalesce=True)
+        del knn, kagg
+        gc.collect()
         pos_s = np.searchsorted(uids, union["s1_uid"].to_numpy())
         pos_r = np.searchsorted(uids, union["rec_uid"].to_numpy())
         a1 = rowwise_cos(A, A, pos_s, pos_r)
         a1[~(has_addr[pos_s] & has_addr[pos_r])] = np.nan
-        union = union.with_columns([pl.Series("a1_cos", a1), pl.Series("n1_cos", rowwise_cos(C, C, pos_s, pos_r)),
-                                    pl.lit(country).alias("country")])
+        n1 = rowwise_cos(C, C, pos_s, pos_r)
+        del A, C, pos_s, pos_r
+        union = union.with_columns([pl.Series("a1_cos", a1), pl.Series("n1_cos", n1), pl.lit(country).alias("country")])
+        del a1, n1
         log().info("  [%s/%s] union pairs: %d (%.1f per S1)", split, country, union.height,
                    union.height / max(1, len(s1_all)))
         union.sort(["s1_uid", "rec_uid"]).write_parquet(udir / f"{safe(country)}.parquet")
         info[country] = {"pairs": union.height, "s1": int(len(s1_all)), "pairs_per_s1": union.height / max(1, len(s1_all))}
-        del union, knn, kp, kagg, A, C, pos_s, pos_r, a1
+        del union
         gc.collect()
     return info
