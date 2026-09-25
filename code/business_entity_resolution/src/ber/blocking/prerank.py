@@ -17,7 +17,7 @@ import polars as pl
 from rapidfuzz import fuzz
 from rapidfuzz.process import cpdist
 
-from ..eval.metric import ceiling
+from ..eval.metric import ceiling, macro_f05
 from ..models.gbdt import fit_folds, load_folds, predict_by_fold, to_matrix
 from ..utils import chunks, ensure_dir, inference_only, load_json, log, n_workers, save_json, work_dir
 from .candidates import scan_union, union_files
@@ -209,10 +209,25 @@ def _score_split(cfg, split: str, models) -> None:
 
 
 def _tune_floor(cfg, mdir) -> None:
+    import gc
+
     pc = cfg.prerank
     truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet"))
     s1 = pl.read_parquet(work_dir(cfg, "train", "s1.parquet"))
-    base = ceiling(scan_union(cfg, "train", ["s1_uid", "rec_uid"]).collect(), truth, s1)
+    
+    all_hits = []
+    for uf in union_files(cfg, "train"):
+        chunk = pl.scan_parquet(str(uf)).select(["s1_uid", "rec_uid"]).collect()
+        hits = chunk.join(truth, on=["s1_uid", "rec_uid"])
+        if hits.height > 0:
+            all_hits.append(hits)
+        del chunk, hits
+        gc.collect()
+    hit_df = pl.concat(all_hits) if all_hits else pl.DataFrame({"s1_uid": [], "rec_uid": []})
+    del all_hits
+    base = macro_f05(hit_df, truth, s1)
+    del hit_df
+    gc.collect()
     lean = pl.read_parquet(work_dir(cfg, "train", "cands", "pre_all.parquet"), columns=["s1_uid", "rec_uid", "p_pre"])
     chosen, grid = float(pc.floor_grid[0]), []
     for fl in sorted(float(x) for x in pc.floor_grid):
