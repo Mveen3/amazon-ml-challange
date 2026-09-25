@@ -693,6 +693,12 @@ Kaggle-specific settings:
 
 Full-scale runtime on Kaggle is not yet measured. The notebook reports the session time used after every stage, and has time valves: switch off the cross-encoder, or subsample the train clusters.
 
+**Checkpointing (added 26 Sep).** Every finished stage is committed to a private Hugging Face dataset repo, and a new session restores the work dir, so the 12-hour session limit no longer means starting over (`ber/checkpoint.py`). Only changed files are uploaded. A public repo is refused. Upload failures never stop the run.
+
+**T4 precision.** On a T4, `torch.cuda.is_bf16_supported()` returns True through emulation. So mixed precision is chosen by compute capability: bf16 only on Ampere or newer, otherwise fp16 with gradient scaling.
+
+**Multi-GPU.** The cross-encoder is wrapped so that DataParallel gathers plain logit tensors. This removes any dependence on how a given transformers version structures its model outputs (Kaggle ships transformers 5.x).
+
 ## 15. Timeline (IST)
 
 Workstreams: **A** = data, blocking and features (critical path, CPU box). **B** = neural (GPU box). **C** = validation, decision and submissions. If working solo, A and C come first, and B runs in the background.

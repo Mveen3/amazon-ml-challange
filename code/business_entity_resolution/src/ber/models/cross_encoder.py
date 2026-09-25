@@ -9,6 +9,7 @@ runs without it (``ce.enabled: false`` or no GPU).
 from __future__ import annotations
 
 import math
+import os
 import time
 from pathlib import Path
 
@@ -17,6 +18,11 @@ import polars as pl
 
 from ..features.pair import load_r1
 from ..utils import chunks, ensure_dir, log, torch_device, work_dir
+
+# Model loading in recent transformers prints two progress lines per weight tensor; that floods logs
+# (and notebook output) for no information. Must be set before transformers is imported.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 BUCKET_COLS = ["nm_core_eq", "nm_tset", "ad_tset", "num_hit", "legal_diff", "legal_s_only", "legal_r_only"]
 
@@ -69,21 +75,50 @@ def _training_pairs(cfg, half: int) -> pl.DataFrame:
 
 
 def _load_model(name_or_path: str, device):
+    """-> (tokenizer, net, hf_model).
+
+    ``net(**enc)`` returns the logits as a plain tensor and runs on every visible GPU (DataParallel), so
+    the multi-GPU gather never has to rebuild a transformers ``ModelOutput`` (whose internals change
+    between transformers versions). ``hf_model`` is the underlying model, used for ``save_pretrained``.
+    """
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.disable_progress_bar()
+        hf_logging.set_verbosity_error()
+    except ImportError:  # very old transformers
+        pass
     tok = AutoTokenizer.from_pretrained(name_or_path)
-    model = AutoModelForSequenceClassification.from_pretrained(name_or_path, num_labels=1)
-    model.to(device)
+    hf_model = AutoModelForSequenceClassification.from_pretrained(name_or_path, num_labels=1).to(device)
+
+    class _Logits(torch.nn.Module):
+        def __init__(self, m):
+            super().__init__()
+            self.m = m
+
+        def forward(self, **enc):
+            return self.m(**enc).logits
+
+    net = _Logits(hf_model)
     if device.type == "cuda" and torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
-    return tok, model
+        net = torch.nn.DataParallel(net)
+    return tok, net, hf_model
 
 
 def _amp_dtype():
+    """bf16 only on GPUs with native support (Ampere+, compute capability >= 8); fp16 otherwise.
+
+    ``torch.cuda.is_bf16_supported()`` also returns True when bf16 is merely *emulated* (e.g. on a
+    T4, capability 7.5), which runs without tensor cores and is several times slower than fp16.
+    """
     import torch
 
-    return torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        return torch.bfloat16
+    return torch.float16
 
 
 def train_half(cfg, half: int) -> None:
@@ -95,8 +130,10 @@ def train_half(cfg, half: int) -> None:
     a, b = _texts(text_table(cfg, "train"), pairs)
     y = pairs["label"].to_numpy().astype(np.float32)
     log().info("  CE half %d: %d training pairs (%d pos)", half, len(y), int(y.sum()))
-    tok, model = _load_model(cc.model_name, device)
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cc.lr), weight_decay=0.01)
+    tok, net, hf_model = _load_model(cc.model_name, device)
+    log().info("  CE half %d: %s, %s on %d GPU(s)", half, cc.model_name, _amp_dtype() if device.type == "cuda" else "fp32",
+               torch.cuda.device_count() if device.type == "cuda" else 0)
+    opt = torch.optim.AdamW(net.parameters(), lr=float(cc.lr), weight_decay=0.01)
     bs = int(cc.batch_size)
     steps = int(cc.epochs) * math.ceil(len(y) / bs)
     warm = max(1, int(steps * float(cc.warmup)))
@@ -105,7 +142,7 @@ def train_half(cfg, half: int) -> None:
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and _amp_dtype() == torch.float16)
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    model.train()
+    net.train()
     step, t0 = 0, time.time()
     rng = np.random.default_rng(int(cfg.run.seed) + 7 * half)
     for _ in range(int(cc.epochs)):
@@ -115,12 +152,12 @@ def train_half(cfg, half: int) -> None:
             enc = tok([a[i] for i in idx], [b[i] for i in idx], padding=True, truncation=True,
                       max_length=int(cc.max_len), return_tensors="pt").to(device)
             with torch.autocast(device_type=device.type, dtype=_amp_dtype(), enabled=use_amp):
-                logits = model(**enc).logits.view(-1)
+                logits = net(**enc).view(-1)
                 loss = loss_fn(logits.float(), torch.from_numpy(y[idx]).to(device))
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
             sched.step()
@@ -129,7 +166,7 @@ def train_half(cfg, half: int) -> None:
                 log().info("   CE half %d step %d/%d loss %.4f (%.0f pairs/s)", half, step, steps, loss.item(),
                            step * bs / (time.time() - t0))
     out = ensure_dir(work_dir(cfg, None, "models", "ce", f"half{half}"))
-    (model.module if hasattr(model, "module") else model).save_pretrained(out)
+    hf_model.save_pretrained(out)
     tok.save_pretrained(out)
 
 
@@ -139,7 +176,7 @@ class _Scorer:
     def __init__(self, cfg, model_dir: Path):
         self.cc = cfg.ce
         self.device = torch_device(self.cc.device)
-        self.tok, self.model = _load_model(str(model_dir), self.device)
+        self.tok, self.model, _ = _load_model(str(model_dir), self.device)
         self.model.eval()
 
     def __call__(self, a: list[str], b: list[str]) -> np.ndarray:
@@ -155,7 +192,7 @@ class _Scorer:
                                max_length=int(self.cc.max_len), return_tensors="pt").to(self.device)
                 with torch.autocast(device_type=self.device.type, dtype=_amp_dtype(),
                                     enabled=self.device.type == "cuda"):
-                    out[idx] = self.model(**enc).logits.view(-1).float().cpu().numpy()
+                    out[idx] = self.model(**enc).view(-1).float().cpu().numpy()
         return out
 
 

@@ -10,6 +10,9 @@ paths:
 run:
   cleanup: true                      # drop the candidate-union files once the pre-ranker has consumed them
 
+checkpoint:
+  enabled: true                      # needs the HF_TOKEN Kaggle Secret; without it the run just has no checkpoints
+
 folds:
   n_folds: 4                         # 4 fold models per GBDT instead of 5 (time)
   neural_halves: [[0, 1], [2, 3]]

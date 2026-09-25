@@ -105,17 +105,24 @@ def run_stage(cfg, stage: str, args) -> dict | None:
         if not cfg.ce.enabled:
             log().info("  cross-encoder disabled (ce.enabled=false)")
             return None
+        from ..checkpoint import sync_now
         from ..models.cross_encoder import train_half
         for h in (0, 1):
             if not work_dir(cfg, None, "models", "ce", f"half{h}").exists() or args.force:
                 train_half(cfg, h)
+                sync_now(f"cross-encoder half {h} trained")  # a new session resumes with the next half
     elif stage == "ce_infer":
         if not cfg.ce.enabled:
             return None
+        from ..checkpoint import sync_now
         from ..models.cross_encoder import infer
         i, n = (int(x) for x in (args.shard or "0/1").split("/"))
         for s in _splits(args):
+            if work_dir(cfg, s, "preds", f"ce_part{i:03d}.parquet").exists() and not args.force:
+                log().info("  CE %s shard %d/%d already scored (restored or earlier run)", s, i, n)
+                continue
             infer(cfg, s, i, n)
+            sync_now(f"cross-encoder scores for {s}")
     elif stage == "r2":
         from ..models.rounds import run_r2
         run_r2(cfg)
@@ -158,6 +165,8 @@ def main(argv=None) -> None:
     ap.add_argument("--set", dest="overrides", action="append", default=[], help="dotted.key=value (YAML value)")
     ap.add_argument("--probe", default=None, help="name for a leaderboard-probe variant (predict/outputs)")
     ap.add_argument("--shard", default=None, help="i/n sharding for ce_infer across GPUs")
+    ap.add_argument("--fresh-start", action="store_true",
+                    help="delete this run's Hugging Face checkpoint first (with checkpoint.enabled)")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config, args.overrides)
@@ -170,6 +179,11 @@ def main(argv=None) -> None:
         stages = PIPELINE
     else:
         stages = [s.strip() for s in args.stage.split(",")]
+    from ..checkpoint import activate
+    ckpt = activate(cfg)
+    if args.fresh_start:
+        ckpt.reset()
+    ckpt.restore()  # new session: pull finished stages from Hugging Face, so they are skipped below
     save_json(cfg, work_dir(cfg, None, "_last_config.json"))
     for st in stages:
         if inference_only(cfg) and st in TRAIN_ONLY:
@@ -184,6 +198,7 @@ def main(argv=None) -> None:
         with timer(f"stage {st}"):
             info = run_stage(cfg, st, args)
         mark_done(cfg, st, marker_split, {"seconds": round(time.time() - t0, 1), "info": info})
+        ckpt.sync(f"stage {st} done")  # outputs + completion marker in one commit
 
 
 if __name__ == "__main__":

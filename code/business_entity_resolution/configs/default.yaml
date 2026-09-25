@@ -12,6 +12,14 @@ run:
   cleanup: false                 # delete bulky intermediates once consumed (candidate-union files)
   inference_only: false          # audit mode: test split only, all models loaded from work_dir/models
 
+checkpoint:                      # mirror the work dir to a PRIVATE Hugging Face dataset repo (see ber/checkpoint.py)
+  enabled: false
+  repo_id: null                  # null -> "<your HF username>/<repo_name>"
+  repo_name: amazon-ml-ber-work
+  prefix: full                   # folder inside the repo; a different prefix = an independent run
+  token_env: HF_TOKEN            # env var with a WRITE token (Kaggle: a Kaggle Secret; local: .env)
+  exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*/cands/pre_parts/*", "rp_matrix.npy", "_last_config.json"]
+
 ingest:
   train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
 

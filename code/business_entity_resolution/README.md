@@ -84,12 +84,13 @@ The pseudo-test split relabels about 30% of US clusters as "France", to exercise
 
 ## 4. Full run on Kaggle (2× T4)
 
-`kaggle/amazon_ml_kaggle.ipynb` does everything:
-1. imports the dataset;
-2. clones this repository from GitHub;
-3. installs the few missing packages;
-4. runs the pipeline with `configs/kaggle.yaml`;
-5. writes the submission files, the submission zip and a models bundle to `/kaggle/working`.
+`kaggle/amazon_ml_kaggle.ipynb` holds only the settings and a `git clone`. Every other cell calls `scripts/kaggle_runner.py` from the cloned repository, so code fixes reach Kaggle with the next run and the notebook never needs re-importing. The notebook:
+1. clones this repository;
+2. installs the few missing packages;
+3. loads the Hugging Face token;
+4. imports the dataset;
+5. runs the pipeline with `configs/kaggle.yaml`, checkpointing every finished stage to a private Hugging Face repo;
+6. writes the submission files, the submission zip and a models bundle to `/kaggle/working`.
 
 ### 4.1 One-time: upload the data as a Kaggle Dataset
 1. Zip your local `dataset/` folder (the one containing `train/` and `test/`) into `amazon-ml.zip`.
@@ -98,16 +99,27 @@ The pseudo-test split relabels about 30% of US clusters as "France", to exercise
 Any folder layout inside the zip works. The notebook finds the 7 TSV files wherever they are, and unpacks the archive itself if Kaggle left it zipped.
 
 ### 4.2 Create the notebook
-1. On kaggle.com go to **Create → New Notebook**.
-2. **File → Import Notebook**, and upload `kaggle/amazon_ml_kaggle.ipynb` (download it from GitHub first).
-3. In the right-hand panel, set **Accelerator → GPU T4 x2** and **Internet → On**. Internet requires a phone-verified account.
-4. **Add Input → Datasets → Your Datasets →** `amazon-ml`.
-5. In the first code cell, set `TEAM_NAME`. Also set `DATASET_SLUG` if you named the dataset differently.
+1. On kaggle.com go to **Create → New Notebook**, then **File → Import Notebook**, and upload `kaggle/amazon_ml_kaggle.ipynb` (download it from GitHub first).
+2. In the right-hand panel, set **Accelerator → GPU T4 x2** and **Internet → On**. Internet requires a phone-verified account.
+3. **Add Input → Datasets → Your Datasets →** `amazon-ml`.
+4. Add the Hugging Face token for checkpoints:
+   - Go to **Add-ons → Secrets → Add Secret**.
+   - Set Label to `HF_TOKEN`. Set Value to the part after `HF_TOKEN=` in your local `.env`; the token needs **write** access.
+   - Tick the secret's checkbox so it is attached to this notebook.
+5. In the first code cell, check `TEAM_NAME` (`neural_nexus`) and `DATASET_SLUG`.
 
 ### 4.3 Run
-- **Check first:** set `RUN_SMOKE_FIRST = True` and `RUN_FULL = False`, then **Run All**. This takes about 10–15 minutes and runs the whole pipeline on a 5k-entity sample, including the real cross-encoder on the GPU.
-- **Full run:** set `RUN_FULL = True`, then **Save Version → Save & Run All (Commit)**. It keeps running after you close the browser. Kaggle stops any session at 12 hours.
-- **Results:** open the version's **Output** tab. It contains `matching_results.tsv` (upload this to the portal), `<team>_submission.zip`, `<team>_models.tar.gz`, `reports/` (out-of-fold F0.5 and so on) and `logs/`.
+- **Rehearsal first:** set `RUN_SMOKE_FIRST = True` and `RUN_FULL = False`, then **Run All**. It takes about 10–15 minutes and runs the *full-run config* on a 5k-entity sample: the real cross-encoder on both GPUs, plus a real Hugging Face save → restore → skip round trip. It must end with `SMOKE TEST PASSED`.
+- **Full run:** set `RUN_SMOKE_FIRST = False` and `RUN_FULL = True`, then **Save Version → Save & Run All (Commit)**. It keeps running after you close the browser. Kaggle stops any session at 12 hours.
+- **Results:** open the version's **Output** tab. It contains `matching_results.tsv` (upload this to the portal), `neural_nexus_submission.zip`, `neural_nexus_models.tar.gz`, `reports/` (out-of-fold F0.5 and so on) and `logs/`.
+
+### 4.3.1 Checkpoints and resuming (`ber/checkpoint.py`)
+- **What gets saved:** with the token, every finished stage's outputs are pushed together with its completion marker, as one commit, to the **private** dataset repo `<hf-user>/amazon-ml-ber-work`, folder `full/`. Only changed files are uploaded. The cross-encoder is also checkpointed after each half and each scoring split.
+- **Resuming:** if a session stops (12-hour limit, crash, lost connection), commit the notebook again. The first stage call finds an empty work dir, downloads the checkpoint, prints `restored … finished stages: …`, skips those stages and continues.
+- **Fresh start:** `FRESH_START = True` deletes the saved progress and starts over. Use it after changing code or settings that affect earlier stages, otherwise stale restored stages are reused.
+- **Safety:** the code refuses to upload to a **public** repo, because the checkpoint contains competition-derived data. It reads only `HF_TOKEN` and never prints it.
+- **Failures:** an upload failure is logged and retried after the next stage. A missing token just turns checkpointing off.
+- **Locally:** set `checkpoint.enabled: true` (`--set checkpoint.enabled=true`); the token is then read from `.env`.
 
 ### 4.4 What `configs/kaggle.yaml` changes
 Only scale and speed settings change; the code path is the same as on AWS.
@@ -128,7 +140,7 @@ Full-scale runtime on Kaggle has **not been measured**. The notebook prints the 
 - Set `EXTRA_OVERRIDES = ["ingest.train_s1_frac=0.6"]` to train on 60% of the train clusters. The test set is never subsampled.
 - Set `EXTRA_OVERRIDES = ["r1.gbdt.rounds=1000", "r2.gbdt.rounds=1000"]`.
 
-A session that hits the limit loses its scratch files, and the next run starts over. Completed stages are skipped only within the same session.
+With Hugging Face checkpoints on, a session that hits the limit loses nothing but the stage that was running: commit again and it resumes (§4.3.1). Without checkpoints, the next run starts over.
 
 ---
 
@@ -265,6 +277,7 @@ The local layout (`code/business_entity_resolution/`) is the layout the challeng
 | `gbdt_base.backend`, `*.gbdt.device` | `lightgbm` or `xgboost`; XGBoost device `auto`, `cpu` or `cuda` |
 | `ingest.train_s1_frac` | Train on a fraction of the train clusters (time valve; test is never subsampled) |
 | `run.cleanup` | Delete the candidate-union files after the pre-ranker has used them |
+| `checkpoint.*` | Private Hugging Face checkpointing of the work dir: `enabled`, `repo_id`/`repo_name`, `prefix` (one folder per independent run), `token_env`, `exclude` |
 | `prerank.ceiling_tol` | Allowed best-achievable-score loss when choosing the pre-ranker floor (default 0.0002) |
 | `expand.*` | 2-hop expansion; applied to test only if it raised the train best achievable score by `min_gain` |
 | `r1/r2.monotone` | Monotone-constraint ablation for France robustness |
