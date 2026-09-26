@@ -39,7 +39,8 @@ STAGE_FILES = {
     "prerank": ["models/prerank/fold*", "models/prerank/importance.json", "models/prerank/trained.json",
                 "models/prerank/floor.json", "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*"],
     "expand": ["models/prerank/expand.json", "*/cands/final.parquet"],
-    "features": ["*/feats/r1/*", "*/feats/r1_plan.json", "*/tokidf_*.pkl"],
+    "features": ["*/feats/r1/*", "*/feats/r1_plan.json", "*/tokidf_*.pkl", "*/admin_vocab.json",
+                 "models/density_ref.json"],
     "r1": ["models/r1/*", "*/preds/r1.parquet"],
     "ce_train": ["models/ce/*"],
     "ce_infer": ["*/preds/ce_*"],
@@ -97,11 +98,15 @@ class Checkpointer:
         self.exclude = list(cc.get("exclude", []))
         # track mode: start from another run's folder (read only), write this run's progress to ``prefix``
         base = cc.get("restore_from")
-        self.base = str(base).strip("/") if base else None
-        if self.base == self.prefix:
-            self.base = None
+        bases = base if isinstance(base, (list, tuple)) else ([base] if base else [])
+        # one or more finished runs to start from, restored in order (a later one overrides an earlier one)
+        self.bases = [str(x).strip("/") for x in bases if x and str(x).strip("/") != self.prefix]
+        self.base = self.bases[-1] if self.bases else None
         self.base_skip = (track_skip_patterns(cc.get("start_from"), list(cc.get("keep_stages") or []))
-                          + list(cc.get("restore_ignore") or [])) if self.base else []
+                          + list(cc.get("restore_ignore") or [])) if self.bases else []
+        # files restored from the bases even though their stage is re-done (e.g. trained models for an
+        # inference-only track that recomputes features and scores)
+        self.base_keep = list(cc.get("restore_keep") or []) if self.bases else []
         self.repo = None
         if not self.enabled:
             return
@@ -131,8 +136,8 @@ class Checkpointer:
                                "files. Make it private (repo Settings) or set checkpoint.repo_id.")
         self.repo = repo
         log().info("  checkpoint: private repo hf://datasets/%s, folder '%s'%s", repo, self.prefix,
-                   f" (track: starts from folder '{self.base}', re-does '{cc.get('start_from')}' onwards)"
-                   if self.base else "")
+                   f" (track: starts from folder(s) {self.bases}, re-does '{cc.get('start_from')}' onwards)"
+                   if self.bases else "")
 
     # ------------------------------------------------------------------ local state
     def _excluded(self, rel: str) -> bool:
@@ -183,9 +188,14 @@ class Checkpointer:
         markers = self.work / "_markers"
         if markers.exists() and any(markers.iterdir()):
             return  # this session already has local progress
-        if self.base:
-            # track: the base run's outputs of the stages this track keeps, then the track's own progress on top
-            manifest = self._download_from_hf(prefix=self.base, ignore=self.base_skip, manifest={})
+        if self.bases:
+            # track: the base runs' outputs of the stages this track keeps (+ restore_keep files), then the track's
+            # own progress on top
+            manifest: dict = {}
+            for base in self.bases:
+                manifest = self._download_from_hf(prefix=base, ignore=self.base_skip, manifest=manifest)
+                if self.base_keep:
+                    manifest = self._download_from_hf(prefix=base, allow=self.base_keep, manifest=manifest)
             self._download_from_hf(manifest=manifest)
             return
         self._download_from_hf()
@@ -202,7 +212,7 @@ class Checkpointer:
         self._download_from_hf()
 
     def _download_from_hf(self, prefix: str | None = None, ignore: list[str] | tuple = (),
-                          manifest: dict | None = None) -> dict:
+                          manifest: dict | None = None, allow: list[str] | tuple = ()) -> dict:
         """Download folder ``prefix`` (default: this run's) into the local work dir, skipping ``ignore`` patterns.
 
         Returns and writes the manifest (files known to be on HF, so the next sync uploads only what is new or
@@ -210,7 +220,8 @@ class Checkpointer:
         """
         prefix = prefix or self.prefix
         manifest = {} if manifest is None else manifest
-        remote = [r for r in self._remote_files(prefix) if not any(fnmatch.fnmatch(r, p) for p in ignore)]
+        remote = [r for r in self._remote_files(prefix) if not any(fnmatch.fnmatch(r, p) for p in ignore)
+                  and (not allow or any(fnmatch.fnmatch(r, p) for p in allow))]
         if not remote:
             log().info("  checkpoint: nothing saved yet in '%s'%s", prefix,
                        "" if manifest else " -> starting from scratch")
@@ -222,7 +233,8 @@ class Checkpointer:
         t0 = time.time()
         stage = self.work.parent / f".hf_restore_{self.work.name}"
         shutil.rmtree(stage, ignore_errors=True)
-        snapshot_download(self.repo, repo_type="dataset", allow_patterns=[f"{prefix}/**"],
+        snapshot_download(self.repo, repo_type="dataset",
+                          allow_patterns=[f"{prefix}/{p}" for p in allow] or [f"{prefix}/**"],
                           ignore_patterns=[f"{prefix}/{p}" for p in ignore] or None, local_dir=stage,
                           token=self._token, max_workers=8)
         n, size = 0, 0
@@ -230,7 +242,8 @@ class Checkpointer:
         for p in sorted(src.rglob("*")) if src.exists() else []:
             if p.is_file():
                 rel = p.relative_to(src).as_posix()
-                if any(fnmatch.fnmatch(rel, pat) for pat in ignore):
+                if any(fnmatch.fnmatch(rel, pat) for pat in ignore) or (
+                        allow and not any(fnmatch.fnmatch(rel, pat) for pat in allow)):
                     continue  # defensive: never let a skipped base output reach the work dir
                 dst = self.work / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)

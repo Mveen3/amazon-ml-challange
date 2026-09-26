@@ -28,11 +28,16 @@ from ..normalize.tables import Tables
 from ..normalize.translit import skeleton
 from ..utils import chunks, ensure_dir, load_json, log, n_workers, pmap, save_json, work_dir
 from . import diffsig
-from .context import context_names, score_context
+from .admin import build_admin_vocab, density_match, density_ref, strip_pairs, unlabelled_countries
+from .context import context_names, density_normalize, score_context
 
 NORM_COLS = ["name_norm", "name_latin", "name_core", "name_core_sorted", "name_skel", "name_alts", "legal",
              "is_domain", "domain_body", "script", "dict_cov", "addr_latin", "addr_comps", "addr_tokens", "nums",
              "num_primary", "pin", "phone", "landmark", "bis", "addr_missing"]
+# List-size counts: their scale follows the candidate density of a country and split (train 10.8 candidates
+# per S1, test France 20.4), so they are divided by the country's median before any model sees them
+# (features.density_norm). Ranks, gaps, shares and margins are scale-free and stay as they are.
+DENSITY_COLS_R1 = ["s1_ncand", "rec_ncand", "pre_s1_n", "pre_rec_n"]
 CARRY = ["s1_uid", "rec_uid", "fold", "label", "country", "prof"]
 PASS = PRE_FEATURES + ["p_pre"] + context_names("pre")
 
@@ -88,7 +93,7 @@ def _labelled(pairs: pl.DataFrame, s1: pl.DataFrame, truth: pl.DataFrame | None)
 
 
 def write_shards(cfg, country: str, pairs: pl.DataFrame, norm: pl.DataFrame | pl.LazyFrame, in_dir: Path,
-                 out_dir: Path) -> list[tuple[str, str]]:
+                 out_dir: Path, admin: list[str] | None = None) -> list[tuple[str, str]]:
     """Join both sides' parsed fields in ``join_rows`` chunks and cut ``shard_rows`` input shards.
 
     ``pairs`` is sorted by (s1_uid, rec_uid), so every shard covers a contiguous S1 range. ``norm`` may be lazy:
@@ -114,6 +119,7 @@ def write_shards(cfg, country: str, pairs: pl.DataFrame, norm: pl.DataFrame | pl
             idx += len(block)
             continue
         joined = attach_norm(pairs.slice(s, e - s), norm_c, NORM_COLS)
+        joined = strip_pairs(joined, admin or [])  # no-op for profiles with training labels
         for s2, e2 in chunks(joined.height, shard_rows):
             name = names[idx]
             idx += 1
@@ -304,13 +310,17 @@ def run_features(cfg, split: str) -> None:
     from ..checkpoint import sync_now
 
     build_token_idf(cfg, split)
+    admin = build_admin_vocab(cfg, split)  # {} unless a country has no training labels (e.g. France)
+    unlabelled, ref = unlabelled_countries(cfg, split), density_ref(cfg)
     fc = cfg.features
     in_dir, out_dir = work_dir(cfg, split, "feats", "r1_in"), work_dir(cfg, split, "feats", "r1")
     final = work_dir(cfg, split, "cands", "final.parquet")
     plan = {"join_rows": int(fc.get("join_rows", 4_000_000)), "shard_rows": int(fc.get("shard_rows", 500_000)),
             "pairs": {c: pl.scan_parquet(final).filter(pl.col("country") == c).select(pl.len()).collect().item()
                       for c in countries(cfg, split)},
-            "final_bytes": int(final.stat().st_size)}  # size, not mtime: a checkpoint restore changes mtimes
+            "final_bytes": int(final.stat().st_size),  # size, not mtime: a checkpoint restore changes mtimes
+            "admin": admin, "density_norm": bool(fc.get("density_norm", False)),
+            "density_match": sorted(unlabelled) if ref else []}
     plan_path = work_dir(cfg, split, "feats", "r1_plan.json")
     if plan_path.exists() and out_dir.exists() and load_json(plan_path) == plan:
         log().info("  %s: resuming round-1 features (%d shards already done)", split, len(list(out_dir.glob("*.parquet"))))
@@ -331,7 +341,13 @@ def run_features(cfg, split: str) -> None:
             continue
         pairs = pl.scan_parquet(final).filter(pl.col("country") == country).collect().sort(["s1_uid", "rec_uid"])
         pairs = _labelled(score_context(pairs, "p_pre", "pre"), s1, truth)
-        tasks += write_shards(cfg, country, pairs, norm, in_dir, out_dir)
+        if bool(fc.get("density_norm", False)):
+            pairs = density_normalize(pairs, DENSITY_COLS_R1)
+        elif country in admin or country in unlabelled:  # a profile without labels: counts on the train scale
+            pairs = density_match(pairs, DENSITY_COLS_R1, ref)
+        # one dtype for every country (a rescaled count is fractional): shards of all countries read together
+        pairs = pairs.with_columns([pl.col(c).cast(pl.Float32) for c in DENSITY_COLS_R1 if c in pairs.columns])
+        tasks += write_shards(cfg, country, pairs, norm, in_dir, out_dir, admin.get(country))
         del pairs
         gc.collect()
     del norm, s1, truth

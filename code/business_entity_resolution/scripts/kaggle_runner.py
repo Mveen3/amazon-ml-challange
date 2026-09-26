@@ -26,7 +26,8 @@ SMOKE_SETS = ["mining.min_support=3", "blocking.keyblock.admin_df_min=5", "block
               "blocking.knn.mem_gb=0.002",  # tiny kNN memory budget -> many small query chunks, so both GPUs get work
               # the rehearsal is a self-contained run: with a track config it must never restore the full-data
               # base folder into the sample work dir
-              "checkpoint.prefix=smoke-test", "checkpoint.restore_from=null", "checkpoint.start_from=null"]
+              "checkpoint.prefix=smoke-test", "checkpoint.restore_from=null", "checkpoint.start_from=null",
+              "run.inference_only=false"]  # an inference-only track still rehearses a full sample run
 
 
 def q(x) -> str:

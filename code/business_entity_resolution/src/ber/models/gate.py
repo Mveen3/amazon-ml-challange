@@ -9,7 +9,7 @@ import numpy as np
 import polars as pl
 
 from ..blocking.prerank import s1_stats
-from ..features.context import score_context
+from ..features.context import density_normalize, score_context
 from ..utils import ensure_dir, inference_only, log, n_workers, save_json, work_dir
 from .calibrate import Calibrator
 from .gbdt import load_folds, predict_by_fold, predict_mean, to_matrix, train_oof
@@ -42,7 +42,10 @@ def entity_frame(cfg, split: str, r2: pl.DataFrame) -> pl.DataFrame:
     s1 = pl.read_parquet(work_dir(cfg, split, "s1.parquet")).join(s1_stats(cfg, split), on="s1_uid", how="left")
     ent = s1.join(agg, on="s1_uid", how="left")
     fill0 = ["g_top1", "g_top2", "g_top3", "g_gap12", "g_sum", "g_n03", "g_n05", "g_n08", "g_n_owned", "g_ncand"]
-    return ent.with_columns([pl.col(c).fill_null(0) for c in fill0]).sort("s1_uid")
+    ent = ent.with_columns([pl.col(c).fill_null(0) for c in fill0])
+    if bool(cfg.gate.get("density_norm", True)):  # list sizes relative to the country's typical list
+        ent = density_normalize(ent, ["g_ncand", "g_n_owned"], by="prof")
+    return ent.sort("s1_uid")
 
 
 def run_gate(cfg) -> None:

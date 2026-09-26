@@ -23,10 +23,11 @@ checkpoint:                      # mirror the work dir to a PRIVATE Hugging Face
   exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*.tmp", "*.tmp/*", "rp_matrix.npy", "_last_config.json",
             "*/vec/*/comb_rp.npy", "*/vec/*/addr_rp.npy"]   # vectors: big and deterministic, rebuilt on demand
   # pre-ranker chunk parts (cands/pre_parts) and feature shards ARE checkpointed: long stages resume mid-way
-  restore_from: null             # track mode: folder of a finished run to start from (read only)
+  restore_from: null             # track mode: folder (or list of folders, later ones win) of finished runs (read only)
   start_from: null               # stage the track re-does from; base outputs of it and later stages are skipped
   keep_stages: []                # later stages whose base outputs the track keeps (e.g. [ce_train, ce_infer])
   restore_ignore: []             # extra base files a track does not need (saves download time)
+  restore_keep: []               # base files restored although their stage is re-done (models for inference-only tracks)
 
 ingest:
   train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
@@ -103,6 +104,13 @@ expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10, min_gain: 0.
          probe_entities: 0}      # 0 = evaluate on all train entities; N = decide on a sample of N first
 
 features:
+  density_norm: false            # r1 list-size counts divided by the country median (needs r1 retraining)
+  density_match: true            # profiles WITHOUT labels (France): r1 list-size counts put on the train scale
+  admin_strip:                   # address admin level ignored for profiles WITHOUT training labels (France)
+    enabled: true
+    s1_last_share: 0.02          # components ending >= 2% of the country's S1 addresses (regions / states)
+    rec_share: 0.005             # record components in >= 0.5% of S2/S3 addresses ...
+    max_s1_ratio: 0.05           # ... that are (almost) absent from S1 addresses (departments / counties)
   sync_every: 20                 # checkpoint finished shards every N shards (the stage resumes mid-way)
   shard_rows: 500000             # pairs per round-1 feature shard (one worker task)
   join_rows: 4000000             # pairs joined with parsed text at a time when writing shards
@@ -139,10 +147,13 @@ r2:
   gbdt: *gbdt
   monotone: []
   conf_tau: 0.8
+  close_gap: 0.1                 # S1s within this p1 of a record's best S1 count as close competitors
+  density_norm: true             # c1 list-size counts divided by the country median (France lists are 2x longer)
   top_members: 8
   chunk_s1: 200000
 
 gate:
+  density_norm: true             # g_ncand / g_n_owned divided by the country median
   gbdt:
     <<: *gbdt
     rounds: 1500

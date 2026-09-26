@@ -1,0 +1,37 @@
+# FINAL configuration: the settings behind the final submission, runnable end to end from scratch.
+#
+#   python -m ber.pipeline.run --config configs/final.yaml --stage all                      # train + predict
+#   python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all
+#                                                           # new test data, trained models from the bundle
+#
+# Built on the Kaggle profile (fits 2x T4 / 4 CPU / 30 GB RAM; a larger machine works unchanged). Compared with
+# configs/kaggle.yaml it adds (improvement.md, all measured or checked on train out-of-fold where labels exist):
+#   * r1 trained on 800k entities, r2 on 700k (Track A, 800k/800k: OOF 0.98933 -> 0.98952);
+#   * competing-cluster features in round 2 (features/consensus.py: COMP_FEATURES);
+#   * list-size counts divided by the country median in round 2 and the gate (France lists are 2x longer);
+#   * for profiles without training labels (France): the address admin level learned from the data is ignored in
+#     pair features, and r1 list-size counts are put on the train scale (features/admin.py);
+#   * the expected-F0.5 set rule is searched next to the grid rule and used only where it wins on OOF;
+#   * the stress check is off (its orphan-cluster hypothesis is refuted by the data).
+inherit: kaggle.yaml
+
+paths:                               # standalone defaults (the Kaggle notebook overrides all three)
+  work_dir: work
+  data_dir: ../../dataset
+  output_dir: ../../output
+
+checkpoint:
+  prefix: final                      # Hugging Face folder when checkpointing is on (needs HF_TOKEN; else off)
+
+r1:
+  sample_entities: 800000
+  max_train_rows: 9000000
+  gbdt: {max_entities: 800000}
+
+r2:                                  # 700k, not 800k: round 2 gained 10 features, and Track A's r2 already peaked at
+  sample_entities: 700000            # 30.2 GB of Kaggle's 33.7 GB (measured); this keeps a ~3 GB margin
+  max_train_rows: 8000000
+  gbdt: {max_entities: 700000}
+
+stress:
+  enabled: false

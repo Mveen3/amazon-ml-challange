@@ -1,0 +1,19 @@
+# Track F (improvement.md): France fix, Kaggle GPU session (T4 x2), about 2 h. Run AFTER Track G has finished.
+# Inference only, test split only: recomputes the test pair features with the France adaptations (address admin
+# level ignored, list-size counts on the train scale; features/admin.py) and re-scores the test set with the
+# trained models of Track A (r1) and Track G (r2, gate, thresholds). No model is retrained: India / US predictions
+# stay identical to Track G, so the leaderboard difference between the two submissions is the France effect.
+# Progress goes to the folder 'track_f'.
+inherit: final.yaml
+
+run:
+  inference_only: true
+
+checkpoint:
+  prefix: track_f
+  restore_from: [full, track_a, track_g]
+  start_from: features
+  keep_stages: [ce_train, ce_infer]
+  restore_keep: ["models/r1/*", "models/r2/*", "models/gate/*", "models/thresholds.json"]
+  # models/ce is restored on purpose: this work dir produces the final models bundle (inference-only reruns need it)
+  restore_ignore: ["*/cands/union/*", "*/cands/pre_all.*", "*/cands/pre_parts/*", "train/feats/*", "train/preds/*"]

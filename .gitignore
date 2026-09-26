@@ -26,3 +26,8 @@ __pycache__/
 .hidden/
 dataset.zip
 *.log
+
+track0
+track_a
+output@first_submission
+improvement.md

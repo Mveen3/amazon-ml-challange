@@ -1,0 +1,17 @@
+# Track G (improvement.md): Kaggle GPU session (T4 x2), about 1.3 h.
+# Starts from the finished runs 'full' + 'track_a' (read only) and re-does r2 -> gate -> tune -> predict -> outputs
+# with the final round-2 model (competing-cluster features, list sizes per country). r1 (800k entities, Track A),
+# the features and the cross-encoder scores are reused. Its train out-of-fold report is directly comparable with
+# Track A's 0.98952. Progress goes to the folder 'track_g'.
+inherit: final.yaml
+
+run:
+  extra_stages: [errors]
+
+checkpoint:
+  prefix: track_g
+  restore_from: [full, track_a]
+  start_from: r2
+  keep_stages: [ce_train, ce_infer]
+  restore_ignore: ["*/cands/union/*", "*/vec/*", "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*",
+                   "models/ce/*"]
