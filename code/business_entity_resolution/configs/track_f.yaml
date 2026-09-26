@@ -14,6 +14,7 @@ checkpoint:
   restore_from: [full, track_a, track_g]
   start_from: features
   keep_stages: [ce_train, ce_infer]
-  restore_keep: ["models/r1/*", "models/r2/*", "models/gate/*", "models/thresholds.json"]
+  # the trained models (+ Track G's out-of-fold report, which describes exactly these models)
+  restore_keep: ["models/r1/*", "models/r2/*", "models/gate/*", "models/thresholds.json", "models/oof_report*.json"]
   # models/ce is restored on purpose: this work dir produces the final models bundle (inference-only reruns need it)
   restore_ignore: ["*/cands/union/*", "*/cands/pre_all.*", "*/cands/pre_parts/*", "train/feats/*", "train/preds/*"]

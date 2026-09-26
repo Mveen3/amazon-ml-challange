@@ -346,11 +346,15 @@ class KaggleRun:
 
     # ------------------------------------------------------------------ results
     def results(self) -> None:
-        rep = json.loads((self.work_dir / "models" / "oof_report.json").read_text())
-        keys = ["macro_f05", "ceiling", "micro_precision", "micro_recall", "by_profile", "singleton_f05",
-                "non_singleton_f05", "cands_per_s1"]
-        print("Out-of-fold validation on the full train set (best estimate before submitting):")
-        print(json.dumps({k: rep.get(k) for k in keys}, indent=1))
+        rep_path = self.work_dir / "models" / "oof_report.json"
+        if rep_path.exists():  # an inference-only track does not re-train, so it may not have one
+            rep = json.loads(rep_path.read_text())
+            keys = ["macro_f05", "ceiling", "micro_precision", "micro_recall", "by_profile", "singleton_f05",
+                    "non_singleton_f05", "cands_per_s1"]
+            print("Out-of-fold validation on the full train set (best estimate before submitting):")
+            print(json.dumps({k: rep.get(k) for k in keys}, indent=1))
+        else:
+            print("No out-of-fold report in this run (inference only: the models come from an earlier track).")
         reports = self.working / "reports"
         reports.mkdir(exist_ok=True)
         for f in ["oof_report.json", "thresholds.json", "stress_check.json", "prerank/floor.json",
