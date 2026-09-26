@@ -31,6 +31,24 @@ def q(x) -> str:
     return shlex.quote(str(x))
 
 
+# Exit codes that mean "out of memory": the kernel's OOM killer (SIGKILL -> -9, or 137 via a shell), SIGABRT from a
+# native allocation failure (-6 / 134), and EXIT_OOM (75) from ber.pipeline.run on a Python MemoryError.
+OOM_EXIT_CODES = (-9, 137, -6, 134, 75)
+
+# Settings for a stage retried after running out of memory. They only shrink memory use: fold models train one at a
+# time, training samples shrink, fewer worker processes run at once. Chunk / shard sizes are NOT changed, because they
+# are part of the resume plans (changing them would throw away finished sub-steps).
+_SEQUENTIAL_FOLDS = [f"{s}.gbdt.parallel_folds=false" for s in ("prerank", "r1", "r2", "gate")]
+LOW_MEMORY_LEVELS = [
+    _SEQUENTIAL_FOLDS + ["prerank.max_train_rows=6000000", "r1.sample_entities=300000", "r2.sample_entities=300000",
+                         "r1.max_train_rows=5000000", "r2.max_train_rows=5000000",
+                         "ce.parallel_halves=false", "ce.infer_chunk=250000"],
+    _SEQUENTIAL_FOLDS + ["prerank.max_train_rows=3000000", "r1.sample_entities=150000", "r2.sample_entities=150000",
+                         "r1.max_train_rows=3000000", "r2.max_train_rows=3000000",
+                         "ce.parallel_halves=false", "ce.infer_chunk=100000", "run.n_workers=2"],
+]
+
+
 class KaggleRun:
     def __init__(self, pkg, config="configs/kaggle.yaml", dataset_slug="amazon-ml", team="neural_nexus",
                  use_cross_encoder=True, use_hf_checkpoint=True, fresh_start=False, overrides=(),
@@ -219,32 +237,8 @@ class KaggleRun:
                 self.status(sets, activity=True)
                 next_beat = time.time() + self.heartbeat_s
 
-    def _hf_crash_restore(self, sets: list[str]) -> bool:
-        """After a SIGKILL (OOM), re-download whatever was last pushed to HF.
-
-        Returns True if the restore succeeded, False otherwise.
-        """
-        if not self.use_ckpt:
-            return False
-        print("\n⚠ Process killed (likely OOM) — attempting HF crash recovery …")
-        restore_script = (
-            "from ber.config import load_config; "
-            "from ber.checkpoint import activate; "
-            f"cfg = load_config({self.config!r}, {sets!r}); "
-            "ckpt = activate(cfg); "
-            "ckpt.force_restore()"
-        )
-        r = subprocess.run([sys.executable, "-c", restore_script], cwd=self.pkg, env=self._env(),
-                           text=True, capture_output=True, timeout=600)
-        print((r.stdout + r.stderr).strip()[-3000:])
-        if r.returncode == 0:
-            print("✔ HF crash recovery successful — sub-stage progress restored.")
-            return True
-        print("✘ HF crash recovery failed; the next run will still use the last checkpoint.")
-        return False
-
     def run(self, stages: str, sets: list[str], log_name: str = "pipeline.log", fresh: bool = False,
-            _retry: bool = False) -> None:
+            _level: int = 0) -> None:
         cmd = [sys.executable, "-u", "-m", "ber.pipeline.run", "--config", self.config, "--stage", stages]
         for s in sets:
             cmd += ["--set", s]
@@ -271,13 +265,17 @@ class KaggleRun:
         print(f"\n[{stages}] exit {p.returncode} in {(time.time() - t0) / 60:.1f} min | session time used: {self._hours()}")
         self.status(sets)
         if p.returncode != 0:
-            # ── OOM crash recovery: exit -9 (SIGKILL) is the classic OOM killer signal ──
-            if p.returncode in (-9, -6, 137) and not _retry:
-                if self._hf_crash_restore(sets):
-                    print(f"\n↻ Retrying stage(s) '{stages}' with restored sub-stage progress …\n")
-                    return self.run(stages, sets, log_name=log_name, fresh=False, _retry=True)
-            raise RuntimeError(f"stage(s) '{stages}' failed - see the log above ({self.logs / log_name}). "
-                               "Re-running this cell resumes at the failed stage.")
+            out_of_memory = p.returncode in OOM_EXIT_CODES
+            if out_of_memory and _level < len(LOW_MEMORY_LEVELS):
+                extra = LOW_MEMORY_LEVELS[_level]
+                print(f"\n⚠ '{stages}' ran out of memory (exit {p.returncode}). The local work dir is intact and "
+                      f"finished sub-steps are kept, so the retry continues where it stopped, with lower-memory "
+                      f"settings (level {_level + 1}/{len(LOW_MEMORY_LEVELS)}):\n   " + " ".join(extra) + "\n")
+                return self.run(stages, sets + extra, log_name=log_name, fresh=False, _level=_level + 1)
+            hint = ("it still ran out of memory at the lowest-memory settings" if out_of_memory
+                    else "see the error above")
+            raise RuntimeError(f"stage(s) '{stages}' failed ({hint}; full log: {self.logs / log_name}). Everything "
+                               "finished so far is checkpointed: Save & Run All again resumes from there.")
 
     def stage(self, stages: str) -> None:
         """One group of full-run stages (finished stages are skipped, also after a checkpoint restore)."""

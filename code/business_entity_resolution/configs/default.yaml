@@ -19,8 +19,9 @@ checkpoint:                      # mirror the work dir to a PRIVATE Hugging Face
   repo_name: amazon-ml-ber-work
   prefix: full                   # folder inside the repo; a different prefix = an independent run
   token_env: HF_TOKEN            # env var with a WRITE token (Kaggle: a Kaggle Secret; local: .env)
-  exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*/cands/pre_parts/*", "rp_matrix.npy", "_last_config.json",
-            "*/vec/*/comb_rp.npy", "*/vec/*/addr_rp.npy"]   # big and deterministic: rebuilt on demand
+  exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*.tmp", "*.tmp/*", "rp_matrix.npy", "_last_config.json",
+            "*/vec/*/comb_rp.npy", "*/vec/*/addr_rp.npy"]   # vectors: big and deterministic, rebuilt on demand
+  # pre-ranker chunk parts (cands/pre_parts) and feature shards ARE checkpointed: long stages resume mid-way
 
 ingest:
   train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
@@ -89,18 +90,22 @@ prerank:
   keep_rev_top: 2
   floor_low: 0.0005
   max_per_s1: 60
-  chunk_rows: 5000000            # union pairs scored per chunk (bounds RAM)
+  chunk_rows: 5000000            # union pairs scored per chunk (bounds RAM); part of the resume plan, keep fixed
+  max_train_rows: 10000000       # cap on training rows (entities = min(sample_entities, cap / union pairs per S1))
+  sync_every: 10                 # checkpoint the scored chunks every N chunks
 
 expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10, min_gain: 0.0005,
          probe_entities: 0}      # 0 = evaluate on all train entities; N = decide on a sample of N first
 
 features:
+  sync_every: 20                 # checkpoint finished shards every N shards (the stage resumes mid-way)
   shard_rows: 500000             # pairs per round-1 feature shard (one worker task)
   join_rows: 4000000             # pairs joined with parsed text at a time when writing shards
   rare_df: 50                    # tokens with df <= rare_df count as "rare" in diff signatures
 
 r1:
   sample_entities: 1000000       # S1 entities loaded for training; OOF/test scoring streams over all shards
+  max_train_rows: 8000000        # cap on training rows (entities = min(sample_entities, cap / pairs per S1))
   gbdt: *gbdt
   monotone: []                   # ablation for France: e.g. [ad_tfidf, num_hit, nm_tset]
 
@@ -120,9 +125,12 @@ ce:
   band: [0.02, 0.98]
   top_rank: 3
   infer_chunk: 1000000           # pairs turned into text and scored at a time
+  part_rows: 250000              # scores saved per part (an interrupted scoring resumes from finished parts)
+  sync_minutes: 15               # push finished parts to the checkpoint this often while the GPUs score
 
 r2:
   sample_entities: 1000000
+  max_train_rows: 8000000
   gbdt: *gbdt
   monotone: []
   conf_tau: 0.8

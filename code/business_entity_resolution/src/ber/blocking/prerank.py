@@ -11,6 +11,7 @@ value whose ceiling stays within ``ceiling_tol`` of the unfiltered union.
 from __future__ import annotations
 
 import shutil
+import time
 
 import numpy as np
 import polars as pl
@@ -123,13 +124,6 @@ def _cheap_chunk(df: pl.DataFrame, pair_cols: list[str], workers: int) -> pl.Dat
     return df.select(list(dict.fromkeys(keep)))
 
 
-def _labels(pairs: pl.DataFrame, cfg) -> pl.DataFrame:
-    truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
-    s1 = pl.read_parquet(work_dir(cfg, "train", "s1.parquet"), columns=["s1_uid", "fold"])
-    return (pairs.join(truth, on=["s1_uid", "rec_uid"], how="left").with_columns(pl.col("label").fill_null(0))
-            .join(s1, on="s1_uid", how="left").sort(["s1_uid", "rec_uid"]))
-
-
 def _select(df: pl.DataFrame, floor: float, pc) -> pl.DataFrame:
     df = df.with_columns(pl.col("p_pre").rank("ordinal", descending=True).over("rec_uid").alias("_rrank"))
     kept = df.filter((pl.col("p_pre") >= floor) |
@@ -138,16 +132,33 @@ def _select(df: pl.DataFrame, floor: float, pc) -> pl.DataFrame:
     return kept.filter(pl.col("_srank") <= int(pc.max_per_s1)).drop(["_rrank", "_srank"])
 
 
+def _trained(cfg, mdir) -> bool:
+    """Fold models from an earlier (interrupted) attempt of this stage can be reused."""
+    return (mdir / "trained.json").exists() and len(list(mdir.glob("fold*.meta.json"))) == int(cfg.folds.n_folds)
+
+
 def run_prerank(cfg) -> None:
-    """Train on sampled entities, then stream-score every union file (train OOF, test fold-mean)."""
+    """Train on sampled entities, then stream-score every union file (train OOF, test fold-mean).
+
+    Resumable: trained fold models and every scored chunk are kept (and checkpointed), so an interrupted attempt
+    continues where it stopped instead of starting over.
+    """
+    from ..checkpoint import sync_now
+
     pc = cfg.prerank
     mdir = ensure_dir(work_dir(cfg, None, "models", "prerank"))
     if not inference_only(cfg):
-        _train_prerank(cfg, mdir)
+        if _trained(cfg, mdir):
+            log().info("  pre-ranker models from an earlier attempt found -> reusing them")
+        else:
+            _train_prerank(cfg, mdir)
+            # trained_at identifies this set of models in the scoring plans: scores from other models are never reused
+            save_json({"n_folds": int(cfg.folds.n_folds), "trained_at": time.time()}, mdir / "trained.json")
+            sync_now("prerank models trained")
     models = load_folds(mdir)
     if not inference_only(cfg):
-        _score_split(cfg, "train", models)
-        _tune_floor(cfg, mdir)
+        if _score_split(cfg, "train", models) or not (mdir / "floor.json").exists():
+            _tune_floor(cfg, mdir)
     _score_split(cfg, "test", models)
     floor = float(load_json(mdir / "floor.json")["floor"])
     for split in (("test",) if inference_only(cfg) else ("train", "test")):
@@ -159,53 +170,121 @@ def _keep_min(pc) -> float:
     return min(float(pc.floor_low), min(float(x) for x in pc.floor_grid))
 
 
+def _train_sample(cfg, s1: pl.DataFrame) -> pl.Series:
+    """S1 entities whose union rows train the pre-ranker, capped by rows as well as entities.
+
+    At full scale the union holds ~80 pairs per S1 (vs ~55 on a sample), so a fixed entity count can mean 30M+
+    training rows. ``prerank.max_train_rows`` bounds it: entities = min(sample_entities, max_rows / pairs-per-S1).
+    """
+    pc = cfg.prerank
+    n_rows = sum(pl.scan_parquet(f).select(pl.len()).collect().item() for f in union_files(cfg, "train"))
+    per_s1 = max(1.0, n_rows / max(1, s1.height))
+    n_ent = min(int(pc.sample_entities), int(int(pc.get("max_train_rows", 10_000_000)) / per_s1), s1.height)
+    log().info("  pre-ranker sample: %d entities (union has %.1f pairs/S1 -> ~%.1fM training rows)",
+               n_ent, per_s1, n_ent * per_s1 / 1e6)
+    if n_ent >= s1.height:
+        return s1["s1_uid"]
+    return s1["s1_uid"].sample(n_ent, seed=int(cfg.run.seed)).sort()
+
+
 def _train_prerank(cfg, mdir) -> None:
+    import gc
+
     pc = cfg.prerank
     s1 = pl.read_parquet(work_dir(cfg, "train", "s1.parquet"), columns=["s1_uid", "fold"])
-    sample = s1["s1_uid"] if s1.height <= int(pc.sample_entities) else \
-        s1["s1_uid"].sample(int(pc.sample_entities), seed=int(cfg.run.seed)).sort()
-    keep = sample.implode()
+    keep = _train_sample(cfg, s1).implode()
     ctx = cheap_context(cfg, "train")
     rows = []
     for f in union_files(cfg, "train"):
         lf = pl.scan_parquet(f)
         sub = lf.filter(pl.col("s1_uid").is_in(keep)).collect()
         if sub.height:
-            rows.append(cheap_features(sub, cfg, "train", ctx=ctx, counts=candidate_counts(lf)))
-    tr = _labels(pl.concat(rows, how="diagonal_relaxed"), cfg)
+            rows.append(cheap_features(sub, cfg, "train", ctx=ctx, counts=candidate_counts(lf))
+                        .select(["s1_uid", "rec_uid"] + PRE_FEATURES))
+        del sub
+    del ctx  # the norm table (~4 GB at full scale) is not needed for training
+    gc.collect()
+    tr = pl.concat(rows, how="vertical_relaxed")
     del rows
+    truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
+    tr = (tr.join(truth, on=["s1_uid", "rec_uid"], how="left").with_columns(pl.col("label").fill_null(0))
+          .join(s1, on="s1_uid", how="left").sort(["s1_uid", "rec_uid"]))  # fixed order -> reproducible models
+    del truth
     log().info("  pre-ranker training sample: %d pairs of %d entities", tr.height, tr["s1_uid"].n_unique())
     X, y, fold, ents = to_matrix(tr, PRE_FEATURES), tr["label"].to_numpy(), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()
-    del tr  # the polars table is several GB; folds may train concurrently, each with its own copy of X
+    del tr
+    gc.collect()
     fit_folds(X, y, fold, ents, pc.gbdt, PRE_FEATURES, mdir, seed=int(cfg.run.seed), threads=n_workers(cfg))
+    del X
+    gc.collect()
 
 
-def _score_split(cfg, split: str, models) -> None:
-    """Cheap features + p_pre for every union pair, chunk by chunk; keep p_pre >= keep_min."""
+def _score_split(cfg, split: str, models) -> bool:
+    """Cheap features + p_pre for every union pair, chunk by chunk; keep p_pre >= keep_min.
+
+    Chunk results go to ``cands/pre_parts/`` together with a plan (files, row counts, chunk size). A later attempt
+    with the same plan skips chunks already written, and parts are checkpointed every ``prerank.sync_every``
+    chunks, so a crash or a session timeout loses at most that many chunks.
+    """
+    from ..checkpoint import sync_now
+
     pc = cfg.prerank
-    ctx = cheap_context(cfg, split)
-    folds = pl.read_parquet(work_dir(cfg, split, "s1.parquet"), columns=["s1_uid", "fold"])
-    pdir = work_dir(cfg, split, "cands", "pre_parts")
-    if pdir.exists():
-        shutil.rmtree(pdir)
-    ensure_dir(pdir)
-    kmin, n_all, n_kept, part = _keep_min(pc), 0, 0, 0
-    for f in union_files(cfg, split):
-        lf = pl.scan_parquet(f)
-        counts = candidate_counts(lf)
-        n = lf.select(pl.len()).collect().item()
-        for s, e in chunks(n, int(pc.get("chunk_rows", 5_000_000))):
+    cdir = work_dir(cfg, split, "cands")
+    done_flag = cdir / "pre_all.json"
+    files = union_files(cfg, split)
+    kmin, chunk = _keep_min(pc), int(pc.get("chunk_rows", 5_000_000))
+    trained = work_dir(cfg, None, "models", "prerank", "trained.json")
+    plan = {"chunk_rows": chunk, "keep_min": kmin, "models": load_json(trained) if trained.exists() else None,
+            "files": {f.name: pl.scan_parquet(f).select(pl.len()).collect().item() for f in files}}
+    if (cdir / "pre_all.parquet").exists() and done_flag.exists() and (load_json(done_flag) == plan or not files):
+        log().info("  %s: pre-ranker scores already complete -> skipping", split)
+        return False
+    pdir = cdir / "pre_parts"
+    plan_path = pdir / "plan.json"
+    if pdir.exists() and plan_path.exists() and load_json(plan_path) == plan:
+        log().info("  %s: resuming pre-ranker scoring (%d chunks already done)", split,
+                   len(list(pdir.glob("part_*.parquet"))))
+    else:
+        shutil.rmtree(pdir, ignore_errors=True)
+        ensure_dir(pdir)
+        save_json(plan, plan_path)
+    total = sum(len(list(chunks(n, chunk))) for n in plan["files"].values())
+    ctx, folds = None, pl.read_parquet(work_dir(cfg, split, "s1.parquet"), columns=["s1_uid", "fold"])
+    sync_every = int(pc.get("sync_every", 10))
+    n_all, n_kept, part, new_parts = 0, 0, 0, 0
+    for f in files:
+        lf, counts = pl.scan_parquet(f), None
+        for s, e in chunks(plan["files"][f.name], chunk):
+            out = pdir / f"part_{part:05d}.parquet"
+            part += 1
+            if out.exists():
+                n_kept += pl.scan_parquet(out).select(pl.len()).collect().item()
+                n_all += e - s
+                continue
+            if ctx is None:
+                ctx = cheap_context(cfg, split)
+            if counts is None:
+                counts = candidate_counts(lf)
             feats = cheap_features(lf.slice(s, e - s).collect(), cfg, split, ctx=ctx, counts=counts)
             feats = feats.join(folds, on="s1_uid", how="left", maintain_order="left")
             p = predict_by_fold(models, to_matrix(feats, PRE_FEATURES), feats["fold"].to_numpy())
             kept = feats.with_columns(pl.Series("p_pre", p)).filter(pl.col("p_pre") >= kmin)
-            kept.write_parquet(pdir / f"part_{part:05d}.parquet")
-            n_all, n_kept, part = n_all + feats.height, n_kept + kept.height, part + 1
-            log().info("   %s %s rows %d-%d scored (%d kept so far)", split, f.stem, s, e, n_kept)
-    out = work_dir(cfg, split, "cands", "pre_all.parquet")
-    pl.scan_parquet(str(pdir) + "/*.parquet").sink_parquet(out)
+            kept.write_parquet(out.with_suffix(".tmp"))
+            out.with_suffix(".tmp").rename(out)  # a killed write never leaves a half-written part behind
+            n_all, n_kept, new_parts = n_all + feats.height, n_kept + kept.height, new_parts + 1
+            del feats, kept, p
+            log().info("   %s %s rows %d-%d scored (chunk %d/%d, %d kept so far)", split, f.stem, s, e, part, total,
+                       n_kept)
+            if new_parts % sync_every == 0:
+                sync_now(f"prerank {split}: {part}/{total} chunks scored")
+    del ctx
+    out = cdir / "pre_all.parquet"
+    pl.scan_parquet(str(pdir) + "/part_*.parquet").sink_parquet(out)
+    save_json(plan, done_flag)
     shutil.rmtree(pdir)
     log().info("  %s: %d union pairs scored, %d with p_pre >= %.4g kept", split, n_all, n_kept, kmin)
+    sync_now(f"prerank {split}: scoring complete")
+    return True
 
 
 def _tune_floor(cfg, mdir) -> None:

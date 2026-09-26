@@ -7,6 +7,7 @@ subsampled per fold (whole entities, so candidate lists stay intact).
 """
 from __future__ import annotations
 
+import gc
 import json
 import queue
 from concurrent.futures import ThreadPoolExecutor
@@ -181,6 +182,34 @@ def to_matrix(df, features: list[str]) -> np.ndarray:
     return df.select([pl.col(f).cast(pl.Float32) for f in features]).to_numpy()
 
 
+def available_ram_gb() -> float:
+    """RAM the OS can still hand out (GB); a large number if psutil is missing."""
+    try:
+        import psutil
+
+        return psutil.virtual_memory().available / 1e9
+    except Exception:  # noqa: BLE001
+        return 1e9
+
+
+def _concurrent_folds_fit(X: np.ndarray, splits, workers: int, gcfg) -> int:
+    """How many folds may train at once without exhausting host RAM.
+
+    Each concurrent fold holds its own copy of the training slice (``X[fit_m]``) plus XGBoost's quantised index
+    and buffers (~1.6x the slice in total, measured); allow them only while they fit in half of the free RAM.
+    ``gbdt.parallel_folds: false`` (set by the low-memory retry) forces one fold at a time.
+    """
+    if workers <= 1 or not bool(gcfg.get("parallel_folds", True)):
+        return 1
+    per_fold = max(int(fm.sum()) for _, fm, _ in splits) * X.shape[1] * X.itemsize * 2.6 / 1e9
+    free = available_ram_gb()
+    if workers * per_fold > 0.5 * free:
+        log().info("   folds train one at a time: %d x %.1f GB would exceed half of the %.1f GB free RAM",
+                   workers, per_fold, free)
+        return 1
+    return workers
+
+
 def _fold_splits(folds, ents, gcfg, seed: int):
     """(fold, fit mask, validation mask) per fold. Uses the RNG in fold order, so it is identical whether the
     models are then trained one after another or concurrently."""
@@ -208,6 +237,7 @@ def fit_folds(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray,
     splits = _fold_splits(folds, ents, gcfg, seed)
     gpus = gpu_ids(gcfg)
     workers = len(gpus) if len(gpus) >= 2 and len(splits) >= 2 else 1
+    workers = _concurrent_folds_fit(X, splits, workers, gcfg)
 
     def train(sp, gpu: int | None):
         k, fit_m, val_m = sp
@@ -216,7 +246,10 @@ def fit_folds(X: np.ndarray, y: np.ndarray, folds: np.ndarray, ents: np.ndarray,
         m = GBDT(gcfg, features, monotone=monotone, seed=seed + k, threads=max(1, threads // workers) if threads > 0 else threads)
         if gpu is not None and workers > 1:
             m.device = f"cuda:{gpu}"
-        m.fit(X[fit_m], y[fit_m], X[val_m], y[val_m])
+        Xf, yf, Xv, yv = X[fit_m], y[fit_m], X[val_m], y[val_m]
+        m.fit(Xf, yf, Xv, yv)
+        del Xf, yf, Xv, yv
+        gc.collect()
         m.save(Path(out_dir) / f"fold{k}")
         return m
 

@@ -36,6 +36,7 @@ blocking:
   keyblock: {max_block_s1: 50, max_block_pairs: 5000}
 
 prerank:
+  max_train_rows: 10000000           # full scale: ~81 union pairs/S1 -> ~123k entities; 32M rows OOM-killed the stage
   sample_entities: 400000
   chunk_rows: 3000000
   gbdt: {backend: xgboost, device: auto, max_entities: 400000, rounds: 600}

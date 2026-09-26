@@ -10,9 +10,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from ..utils import gpu_cap, log, work_dir
+from ..utils import gpu_cap, log
 
 
 def n_gpus() -> int:
@@ -41,10 +42,22 @@ def _spawn(cfg, gpu: int, args: list[str]) -> subprocess.Popen:
 
 
 def _run(cfg, jobs: list[tuple[int, list[str]]], what: str) -> bool:
-    """Start one worker per (half, args) job (half h on GPU h % n_gpus) and wait for all of them."""
+    """Start one worker per (half, args) job (half h on GPU h % n_gpus) and wait for all of them.
+
+    While they run, the parts they have finished are pushed to the checkpoint every ``ce.sync_minutes``, so a
+    session that ends mid-way resumes from them (the workers themselves never talk to Hugging Face).
+    """
+    from ..checkpoint import sync_now
+
     g = max(1, n_gpus())
     procs = [(_spawn(cfg, h % g, args), h) for h, args in jobs]
     log().info("  CE %s: %d workers running concurrently (GPU %s)", what, len(procs), ", ".join(str(h % g) for _, h in procs))
+    every, last = 60.0 * float(cfg.ce.get("sync_minutes", 15)), time.time()
+    while any(p.poll() is None for p, _ in procs):
+        time.sleep(5)
+        if time.time() - last >= every:
+            sync_now(f"cross-encoder {what}: parts finished so far")
+            last = time.time()
     codes = [(p.wait(), h) for p, h in procs]
     bad = [f"half {h} exit {c}" for c, h in codes if c != 0]
     if bad:
@@ -60,8 +73,6 @@ def infer_halves(cfg, split: str) -> bool:
     from .cross_encoder import merge_halves
 
     if not _run(cfg, [(h, ["--op", "infer", "--half", str(h), "--split", split]) for h in (0, 1)], f"scoring ({split})"):
-        for h in (0, 1):  # drop partial results so the sequential fallback starts clean
-            (work_dir(cfg, split, "preds") / f"ce_half{h}.parquet").unlink(missing_ok=True)
-        return False
+        return False  # finished halves / parts are kept (checked against their plans): the fallback resumes from them
     merge_halves(cfg, split)
     return True

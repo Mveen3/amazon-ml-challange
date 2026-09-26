@@ -164,14 +164,21 @@ class Checkpointer:
                           token=self._token, max_workers=8)
         n, size = 0, 0
         src = stage / self.prefix
+        manifest = {}
         for p in sorted(src.rglob("*")):
             if p.is_file():
-                dst = self.work / p.relative_to(src)
+                rel = p.relative_to(src).as_posix()
+                dst = self.work / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(p, dst)
-                n, size = n + 1, size + dst.stat().st_size
+                st = dst.stat()
+                n, size = n + 1, size + st.st_size
+                if not self._excluded(rel):
+                    manifest[rel] = [st.st_size, st.st_mtime_ns]
         shutil.rmtree(stage, ignore_errors=True)
-        self._write_manifest(self._scan())
+        # The manifest records what the REMOTE holds: only the files that came from it. Local-only files (outputs
+        # not uploaded yet) must stay out of it, otherwise the next sync would think they are already on HF.
+        self._write_manifest(manifest)
         markers = self.work / "_markers"
         done = sorted(p.name.split(".")[0] for p in markers.glob("*.done")) if markers.exists() else []
         log().info("  checkpoint: restored %d files (%.2f GB) in %.0fs; finished stages: %s", n, size / 1e9,

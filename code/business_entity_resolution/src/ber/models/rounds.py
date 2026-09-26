@@ -11,7 +11,7 @@ from ..utils import ensure_dir, inference_only, log, n_workers, save_json, work_
 from .calibrate import Calibrator
 from .cross_encoder import load_ce
 from .gbdt import fit_folds, load_folds, to_matrix
-from .stream import columns_of, entities, load_rows, predict_shards, r1_paths, sample_entities
+from .stream import columns_of, entities, load_rows, predict_shards, r1_paths, training_sample
 
 KEYS = ["s1_uid", "rec_uid"]
 
@@ -28,7 +28,8 @@ def run_r1(cfg) -> None:
     if not inference_only(cfg):
         paths = r1_paths(cfg, "train")
         feats = [f for f in R1_FEATURES if f in columns_of(paths)]
-        sample = sample_entities(entities(paths), int(cfg.r1.sample_entities), int(cfg.run.seed))
+        sample = training_sample(paths, entities(paths), int(cfg.r1.sample_entities),
+                                 int(cfg.r1.get("max_train_rows", 8_000_000)), int(cfg.run.seed), "r1")
         tr = load_rows(paths, KEYS + ["fold", "label"] + feats, sample)
         X, y, fold, ents = to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()
         del tr  # free the polars table before (possibly concurrent) fold training
@@ -90,7 +91,8 @@ def _train_r2(cfg, mdir) -> None:
     paths = r1_paths(cfg, "train")
     avail = columns_of(paths)
     feats = [f for f in R1_FEATURES + R2_EXTRA if f in avail or f in extras.columns]
-    sample = sample_entities(entities(paths), int(cfg.r2.sample_entities), int(cfg.run.seed) + 100)
+    sample = training_sample(paths, entities(paths), int(cfg.r2.sample_entities),
+                             int(cfg.r2.get("max_train_rows", 8_000_000)), int(cfg.run.seed) + 100, "r2")
     tr = load_rows(paths, KEYS + ["fold", "label"] + feats, sample)
     tr = tr.join(extras.filter(pl.col("s1_uid").is_in(sample.implode())), on=KEYS, how="inner").sort(KEYS)
     X, y, fold, ents = to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()

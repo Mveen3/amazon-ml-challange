@@ -36,7 +36,7 @@ def _two_hop(pre: pl.DataFrame, cfg, split: str) -> pl.DataFrame:
     for country in pre["country"].unique().to_list():
         vdir = ensure_vectors(cfg, split, country)  # rebuilt (deterministically) if a restore dropped them
         uids = np.load(vdir / "uids.npy")
-        C = np.load(vdir / "comb_rp.npy")
+        C = np.load(vdir / "comb_rp.npy", mmap_mode="r")  # only the rows indexed below are read into RAM
         sub = pre.filter(pl.col("country") == country)
         conf = sub.filter(pl.col("p_pre") >= float(ec.conf)).select(["s1_uid", pl.col("rec_uid").alias("m")])
         members = conf["m"].unique().sort().to_numpy()

@@ -114,8 +114,16 @@ Any folder layout inside the zip works. The notebook finds the 7 TSV files where
 - **Results:** open the version's **Output** tab. It contains `matching_results.tsv` (upload this to the portal), `neural_nexus_submission.zip`, `neural_nexus_models.tar.gz`, `reports/` (out-of-fold F0.5 and so on) and `logs/`.
 
 ### 4.3.1 Checkpoints and resuming (`ber/checkpoint.py`)
-- **What gets saved:** with the token, every finished stage's outputs are pushed together with its completion marker, as one commit, to the **private** dataset repo `<hf-user>/amazon-ml-ber-work`, folder `full/`. Only changed files are uploaded. The cross-encoder is also checkpointed after each half and each scoring split.
-- **Resuming:** if a session stops (12-hour limit, crash, lost connection), commit the notebook again. The first stage call finds an empty work dir, downloads the checkpoint, prints `restored … finished stages: …`, skips those stages and continues.
+- **What gets saved:** with the token, every finished stage's outputs are pushed together with its completion marker, as one commit, to the **private** dataset repo `<hf-user>/amazon-ml-ber-work`, folder `full/`. Only changed files are uploaded.
+- **Mid-stage progress:** the long stages also save their finished pieces while they run, and a later attempt keeps them:
+  - `block` saves per country.
+  - `prerank` saves its trained models, then its scored chunks every `prerank.sync_every` chunks.
+  - `features` saves its shards every `features.sync_every` shards.
+  - The cross-encoder saves each trained half, and its scored parts every `ce.sync_minutes`.
+
+  Each piece is written atomically: to a `.tmp` file first, then renamed. A *plan* file records row counts, chunk sizes and the model id, and a piece is reused only when its plan matches. So a crash never leaves a half-written piece that looks finished, and scores from another model or chunk size are never mixed in.
+- **Resuming:** if a session stops (12-hour limit, crash, lost connection), commit the notebook again (**Save & Run All**). The first stage call finds an empty work dir, downloads the checkpoint, prints `restored … finished stages: …`, skips those stages and continues inside the interrupted stage from its last saved piece.
+- **Out of memory:** if a stage is killed for memory (exit -9/137, -6/134, or 75 from a Python `MemoryError`), the notebook repeats it at once in the same session with lower-memory settings (`LOW_MEMORY_LEVELS` in `scripts/kaggle_runner.py`, two levels). The retry uses fold models one at a time, smaller training samples and fewer workers. The local work dir is intact, so the retry continues where the killed attempt stopped, with no re-download. Separately, fold models train concurrently only when both copies fit in half the free RAM.
 - **Fresh start:** `FRESH_START = True` deletes the saved progress and starts over. Use it after changing code or settings that affect earlier stages, otherwise stale restored stages are reused.
 - **Safety:** the code refuses to upload to a **public** repo, because the checkpoint contains competition-derived data. It reads only `HF_TOKEN` and never prints it.
 - **Failures:** an upload failure is logged and retried after the next stage. A missing token just turns checkpointing off.
@@ -187,12 +195,12 @@ There **is** a difference. Some settings were reduced to fit the time and memory
 - **Kill switch:** `EXTRA_OVERRIDES = ["run.max_gpus=1"]` forces single-GPU behaviour in every stage. Per-stage caps: `blocking.knn.max_gpus`, `<stage>.gbdt.max_gpus`, and `ce.parallel_halves: false`.
 
 ### 4.5 If the 12-hour limit is tight
-Full-scale runtime on Kaggle has **not been measured**. The notebook prints the session time used after every stage. To shorten a run:
+Measured on Kaggle (2× T4): `block` takes about 2 h 40 min (exact kNN over ~12.5M train and ~11.7M test records, four searches per country, both GPUs near 100%). The later stages have not been measured at full scale; the estimate is 5–6 h. The notebook prints the session time used after every stage. To shorten a run:
 - Set `USE_CROSS_ENCODER = False`. This saves roughly 1–1.5 hours.
 - Set `EXTRA_OVERRIDES = ["ingest.train_s1_frac=0.6"]` to train on 60% of the train clusters. The test set is never subsampled.
 - Set `EXTRA_OVERRIDES = ["r1.gbdt.rounds=1000", "r2.gbdt.rounds=1000"]`.
 
-With Hugging Face checkpoints on, a session that hits the limit loses nothing but the stage that was running: commit again and it resumes (§4.3.1). Without checkpoints, the next run starts over.
+With Hugging Face checkpoints on, a session that hits the limit loses at most the last few minutes of the stage that was running: commit again and it resumes (§4.3.1). Without checkpoints, the next run starts over.
 
 ---
 
@@ -347,7 +355,7 @@ The local layout (`code/business_entity_resolution/`) is the layout the challeng
 
 ## 10. Troubleshooting
 
-- **Out of memory:** lower `prerank.chunk_rows`, `features.join_rows` and `*.sample_entities`. In `block`, also lower `blocking.a1/n1.k_fwd`.
+- **Out of memory:** on Kaggle the notebook retries a killed stage with lower-memory settings automatically (§4.3.1). If it still fails, lower `prerank.max_train_rows`, `r1/r2.max_train_rows`, `*.sample_entities` and `features.join_rows`. In `block`, also lower `blocking.a1/n1.k_fwd`. Changing `prerank.chunk_rows` or `features.shard_rows` discards that stage's saved partial progress, because they are part of its plan.
 - **Kaggle "missing train_source1.tsv …":** the dataset is not attached (**Add Input**), or `DATASET_SLUG` does not match its folder name under `/kaggle/input`.
 - **Kaggle `git clone` fails:** switch **Internet** on in the notebook settings (it needs a phone-verified account).
 - **Slow kNN:** check that the log line `knn: ... on cuda` appears; tune `blocking.knn.mem_gb` to fit your GPU.

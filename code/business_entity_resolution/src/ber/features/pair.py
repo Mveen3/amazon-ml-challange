@@ -8,6 +8,7 @@ features. Output: ``feats/r1/*.parquet``.
 """
 from __future__ import annotations
 
+import gc
 import math
 import pickle
 import shutil
@@ -25,7 +26,7 @@ from ..blocking.vectors import tfidf_rows
 from ..normalize.profiles import ALL_LEGAL_TOKENS, LEGAL_FAMILY
 from ..normalize.tables import Tables
 from ..normalize.translit import skeleton
-from ..utils import chunks, ensure_dir, log, n_workers, pmap, work_dir
+from ..utils import chunks, ensure_dir, load_json, log, n_workers, pmap, save_json, work_dir
 from . import diffsig
 from .context import context_names, score_context
 
@@ -86,23 +87,39 @@ def _labelled(pairs: pl.DataFrame, s1: pl.DataFrame, truth: pl.DataFrame | None)
     return pairs.with_columns(pl.lit(None, dtype=pl.Int8).alias("label"))
 
 
-def write_shards(cfg, country: str, pairs: pl.DataFrame, norm: pl.DataFrame, in_dir: Path,
+def write_shards(cfg, country: str, pairs: pl.DataFrame, norm: pl.DataFrame | pl.LazyFrame, in_dir: Path,
                  out_dir: Path) -> list[tuple[str, str]]:
     """Join both sides' parsed fields in ``join_rows`` chunks and cut ``shard_rows`` input shards.
 
-    ``pairs`` is sorted by (s1_uid, rec_uid), so every shard covers a contiguous S1 range.
+    ``pairs`` is sorted by (s1_uid, rec_uid), so every shard covers a contiguous S1 range. ``norm`` may be lazy:
+    only the rows this country's pairs need are then loaded. Shards whose output already exists (an interrupted
+    earlier attempt with the same plan) are not written again and are not returned as tasks.
     """
     fc = cfg.features
+    join_rows, shard_rows = int(fc.get("join_rows", 4_000_000)), int(fc.get("shard_rows", 500_000))
+    names = []  # shard names in order, from the same arithmetic as the loop below
+    for s, e in chunks(pairs.height, join_rows):
+        names += [None for _ in chunks(e - s, shard_rows)]
+    names = [f"{safe(country)}_{i:05d}.parquet" for i in range(len(names))]
+    todo = {n for n in names if not (out_dir / n).exists()}
+    if not todo:
+        return []
     need = pl.concat([pairs.select(pl.col("s1_uid").alias("uid")), pairs.select(pl.col("rec_uid").alias("uid"))]).unique()
-    norm_c = norm.join(need, on="uid", how="semi")
+    norm_c = (norm.lazy() if isinstance(norm, pl.DataFrame) else norm).join(need.lazy(), on="uid", how="semi").collect()
+    del need
     tasks, idx = [], 0
-    for s, e in chunks(pairs.height, int(fc.get("join_rows", 4_000_000))):
+    for s, e in chunks(pairs.height, join_rows):
+        block = [names[idx + j] for j, _ in enumerate(chunks(e - s, shard_rows))]
+        if not todo.intersection(block):
+            idx += len(block)
+            continue
         joined = attach_norm(pairs.slice(s, e - s), norm_c, NORM_COLS)
-        for s2, e2 in chunks(joined.height, int(fc.get("shard_rows", 500_000))):
-            name = f"{safe(country)}_{idx:05d}.parquet"
-            joined.slice(s2, e2 - s2).write_parquet(in_dir / name)
-            tasks.append((str(in_dir / name), str(out_dir / name)))
+        for s2, e2 in chunks(joined.height, shard_rows):
+            name = names[idx]
             idx += 1
+            if name in todo:
+                joined.slice(s2, e2 - s2).write_parquet(in_dir / name)
+                tasks.append((str(in_dir / name), str(out_dir / name)))
         del joined
     return tasks
 
@@ -136,10 +153,12 @@ def _tok_feats(s: list[str], r: list[str], idf: dict, dflt: float):
     if not s or not r:
         return (NAN,) * 5
     ss, rs = set(s), set(r)
-    w = {t: idf.get(t, dflt) for t in ss | rs}
-    jacc = sum(w[t] for t in ss & rs) / max(1e-6, sum(w.values()))
-    M = cdist(list(ss), list(rs), scorer=JaroWinkler.normalized_similarity, workers=1)
-    sl, rl = list(ss), list(rs)
+    # sorted, never raw set order: set order depends on the per-process string-hash seed, and float sums in a
+    # different order differ in the last bit -> features would not be byte-reproducible across processes
+    sl, rl = sorted(ss), sorted(rs)
+    w = {t: idf.get(t, dflt) for t in sorted(ss | rs)}
+    jacc = sum(w[t] for t in sorted(ss & rs)) / max(1e-6, sum(w.values()))
+    M = cdist(sl, rl, scorer=JaroWinkler.normalized_similarity, workers=1)
     sk_r, sk_s = {skeleton(t) for t in rl}, {skeleton(t) for t in sl}
     ms = [1.0 if (t in rs or skeleton(t) in sk_r or M[i].max() >= 0.9) else 0.0 for i, t in enumerate(sl)]
     mr = [1.0 if (t in ss or skeleton(t) in sk_s or M[:, j].max() >= 0.9) else 0.0 for j, t in enumerate(rl)]
@@ -271,40 +290,62 @@ def compute(df: pl.DataFrame) -> pl.DataFrame:
 
 def _task(args) -> str:
     in_path, out_path = args
-    compute(pl.read_parquet(in_path)).write_parquet(out_path)
+    tmp = Path(out_path).with_suffix(".tmp")
+    compute(pl.read_parquet(in_path)).write_parquet(tmp)
+    tmp.rename(out_path)  # atomic: a killed worker never leaves a half-written shard that looks finished
     Path(in_path).unlink()
     return out_path
 
 
 # ----------------------------------------------------------------------------- driver
 def run_features(cfg, split: str) -> None:
+    """Round-1 features, sharded. Resumable: with the same plan (pair counts, shard sizes), shards finished by an
+    interrupted earlier attempt are kept, and finished shards are checkpointed every ``features.sync_every``."""
+    from ..checkpoint import sync_now
+
     build_token_idf(cfg, split)
+    fc = cfg.features
     in_dir, out_dir = work_dir(cfg, split, "feats", "r1_in"), work_dir(cfg, split, "feats", "r1")
-    for d in (in_dir, out_dir):  # never mix shards from an earlier run
-        if d.exists():
-            shutil.rmtree(d)
-        ensure_dir(d)
+    final = work_dir(cfg, split, "cands", "final.parquet")
+    plan = {"join_rows": int(fc.get("join_rows", 4_000_000)), "shard_rows": int(fc.get("shard_rows", 500_000)),
+            "pairs": {c: pl.scan_parquet(final).filter(pl.col("country") == c).select(pl.len()).collect().item()
+                      for c in countries(cfg, split)},
+            "final_bytes": int(final.stat().st_size)}  # size, not mtime: a checkpoint restore changes mtimes
+    plan_path = work_dir(cfg, split, "feats", "r1_plan.json")
+    if plan_path.exists() and out_dir.exists() and load_json(plan_path) == plan:
+        log().info("  %s: resuming round-1 features (%d shards already done)", split, len(list(out_dir.glob("*.parquet"))))
+    else:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        save_json(plan, plan_path)
+    shutil.rmtree(in_dir, ignore_errors=True)  # inputs are always rebuilt (only for shards still to do)
+    ensure_dir(in_dir)
+    ensure_dir(out_dir)
     s1 = pl.read_parquet(work_dir(cfg, split, "s1.parquet"), columns=["s1_uid", "prof", "fold"])
     truth = None
     if split == "train":
         truth = pl.read_parquet(work_dir(cfg, "train", "truth.parquet")).with_columns(pl.lit(1, dtype=pl.Int8).alias("label"))
-    norm = pl.read_parquet(work_dir(cfg, split, "norm.parquet"), columns=["uid"] + NORM_COLS)
-    final = work_dir(cfg, split, "cands", "final.parquet")
+    norm = pl.scan_parquet(work_dir(cfg, split, "norm.parquet")).select(["uid"] + NORM_COLS)  # lazy: per country
     tasks = []
     for country in countries(cfg, split):  # pairs never cross countries -> context per country is exact
-        pairs = pl.scan_parquet(final).filter(pl.col("country") == country).collect().sort(["s1_uid", "rec_uid"])
-        if pairs.height == 0:
+        if plan["pairs"].get(country, 0) == 0:
             continue
+        pairs = pl.scan_parquet(final).filter(pl.col("country") == country).collect().sort(["s1_uid", "rec_uid"])
         pairs = _labelled(score_context(pairs, "p_pre", "pre"), s1, truth)
         tasks += write_shards(cfg, country, pairs, norm, in_dir, out_dir)
         del pairs
-    del norm
+        gc.collect()
+    del norm, s1, truth
+    gc.collect()
     cf = {"ngram": list(cfg.blocking.ngram), "hash_features": int(cfg.blocking.hash_features)}
-    pmap(_task, tasks, n_workers(cfg), initializer=_init,
-         initargs=(str(work_dir(cfg, split)), str(work_dir(cfg, None, "tables.pkl")), cf), desc=f"r1 feats {split}")
-    if in_dir.exists() and not any(in_dir.iterdir()):  # workers delete inputs as they finish
-        in_dir.rmdir()
-    log().info("  %s: %d feature shards", split, len(tasks))
+    step = max(1, int(fc.get("sync_every", 20)))
+    for b in range(0, len(tasks), step):  # batches: finished shards reach the checkpoint as the stage goes
+        pmap(_task, tasks[b:b + step], n_workers(cfg), initializer=_init,
+             initargs=(str(work_dir(cfg, split)), str(work_dir(cfg, None, "tables.pkl")), cf),
+             desc=f"r1 feats {split} [{b + 1}-{min(len(tasks), b + step)} of {len(tasks)} to do]")
+        if b + step < len(tasks):
+            sync_now(f"features {split}: {b + step}/{len(tasks)} shards")
+    shutil.rmtree(in_dir, ignore_errors=True)
+    log().info("  %s: %d feature shards (%d computed now)", split, len(list(out_dir.glob("*.parquet"))), len(tasks))
 
 
 def load_r1(cfg, split: str, columns=None) -> pl.DataFrame:

@@ -41,6 +41,18 @@ def sample_entities(ents: pl.DataFrame, n: int, seed: int) -> pl.Series:
     return ents["s1_uid"].sample(n, seed=seed).sort()
 
 
+def training_sample(paths: list[Path], ents: pl.DataFrame, n: int, max_rows: int, seed: int, tag: str) -> pl.Series:
+    """Entities to train on, capped by rows as well as entities: rows = entities x candidates per S1, and a fixed
+    entity count can exceed RAM when the candidate lists are long (entities = min(n, max_rows / pairs-per-S1))."""
+    n_rows = pl.scan_parquet([str(p) for p in paths]).select(pl.len()).collect().item() if paths else 0
+    per_s1 = max(1.0, n_rows / max(1, ents.height))
+    n_ent = min(int(n), int(max_rows / per_s1))
+    if n_ent < min(int(n), ents.height):
+        log().info("   %s: training on %d entities (not %d): %.1f pairs/S1 x %d would exceed max_train_rows=%d",
+                   tag, n_ent, min(int(n), ents.height), per_s1, min(int(n), ents.height), max_rows)
+    return sample_entities(ents, n_ent, seed)
+
+
 def load_rows(paths: list[Path], columns: list[str], s1_keep: pl.Series | None = None) -> pl.DataFrame:
     """Rows of the kept entities only, read shard by shard (peak memory = output size)."""
     keep = s1_keep.implode() if s1_keep is not None else None

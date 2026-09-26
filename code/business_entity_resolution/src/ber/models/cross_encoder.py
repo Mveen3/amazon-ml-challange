@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import numpy as np
 import polars as pl
 
 from ..features.pair import load_r1
-from ..utils import chunks, ensure_dir, gpu_cap, log, torch_device, work_dir
+from ..utils import chunks, ensure_dir, gpu_cap, load_json, log, save_json, torch_device, work_dir
 
 # Model loading in recent transformers prints two progress lines per weight tensor; that floods logs
 # (and notebook output) for no information. Must be set before transformers is imported.
@@ -168,9 +169,17 @@ def train_half(cfg, half: int) -> None:
             if step % 500 == 0:
                 log().info("   CE half %d step %d/%d loss %.4f (%.0f pairs/s)", half, step, steps, loss.item(),
                            step * bs / (time.time() - t0))
-    out = ensure_dir(work_dir(cfg, None, "models", "ce", f"half{half}"))
-    hf_model.save_pretrained(out)
-    tok.save_pretrained(out)
+    # Save next to the final directory, then rename: the stage treats an existing half{h}/ as trained, so a
+    # process killed while saving must not leave a half-written one. trained_at identifies this model in the
+    # scoring plans (scores from another model are never reused).
+    out = work_dir(cfg, None, "models", "ce", f"half{half}")
+    tmp = out.with_name(out.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    hf_model.save_pretrained(ensure_dir(tmp))
+    tok.save_pretrained(tmp)
+    save_json({"trained_at": time.time()}, tmp / "ber_trained.json")
+    shutil.rmtree(out, ignore_errors=True)
+    tmp.rename(out)
 
 
 class _Scorer:
@@ -221,7 +230,8 @@ def infer(cfg, split: str, shard: int = 0, nshards: int = 1) -> None:
             ce[s:e] = (scorers[0](a, b) + scorers[1](a, b)) / 2.0
         log().info("   CE %s: %d/%d pairs scored", split, e, df.height)
     out = ensure_dir(work_dir(cfg, split, "preds"))
-    df.select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(out / f"ce_part{shard:03d}.parquet")
+    df.select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(out / f"ce_part{shard:03d}.tmp")
+    (out / f"ce_part{shard:03d}.tmp").rename(out / f"ce_part{shard:03d}.parquet")  # atomic: existence = scored
     log().info("  CE %s shard %d/%d: scored %d pairs", split, shard, nshards, len(ce))
 
 
@@ -230,20 +240,53 @@ def infer_half(cfg, split: str, half: int) -> Path:
 
     Train pairs are scored by the model that never saw their entity (so each pair by exactly one half); test pairs
     are scored by both halves and averaged later by ``merge_halves``.
+
+    Resumable: scores are written in parts of ``ce.part_rows`` pairs under a plan (band size, part size, model id);
+    a later attempt with the same plan keeps the finished parts and scores only the rest. ``ce.infer_chunk`` (texts
+    held in memory at a time) is not part of the plan, so a lower-memory retry still resumes.
     """
+    out = ensure_dir(work_dir(cfg, split, "preds")) / f"ce_half{half}.parquet"
     df = band(cfg, split)
     halves = [list(h) for h in cfg.folds.neural_halves]
     if split == "train":
         df = df.filter(pl.Series(~np.isin(df["fold"].to_numpy(), halves[half])))
-    txt = text_table(cfg, split)
-    scorer = _Scorer(cfg, work_dir(cfg, None, "models", "ce") / f"half{half}")
-    ce = np.empty(df.height, dtype=np.float32)
-    for s, e in chunks(df.height, int(cfg.ce.get("infer_chunk", 1_000_000))):
-        a, b = _texts(txt, df.slice(s, e - s))
-        ce[s:e] = scorer(a, b)
+    mdir = work_dir(cfg, None, "models", "ce") / f"half{half}"
+    stamp = mdir / "ber_trained.json"
+    part_rows = int(cfg.ce.get("part_rows", 250_000))
+    plan = {"rows": df.height, "part_rows": part_rows, "model": load_json(stamp) if stamp.exists() else None}
+    done = out.with_suffix(".json")
+    if out.exists() and done.exists() and load_json(done) == plan:
+        log().info("   CE half %d %s: already scored", half, split)
+        return out
+    pdir = out.with_name(f"ce_half{half}_parts")
+    if (pdir / "plan.json").exists() and load_json(pdir / "plan.json") == plan:
+        log().info("   CE half %d %s: resuming (%d parts already scored)", half, split, len(list(pdir.glob("*.parquet"))))
+    else:
+        shutil.rmtree(pdir, ignore_errors=True)
+        save_json(plan, ensure_dir(pdir) / "plan.json")
+    txt, scorer = None, None
+    sub = max(1, min(part_rows, int(cfg.ce.get("infer_chunk", 1_000_000))))
+    for i, (s, e) in enumerate(chunks(df.height, part_rows)):
+        part = pdir / f"part_{i:05d}.parquet"
+        if part.exists():
+            continue
+        if scorer is None:  # loaded only when something is left to score
+            txt, scorer = text_table(cfg, split), _Scorer(cfg, mdir)
+        ce = np.empty(e - s, dtype=np.float32)
+        for s2, e2 in chunks(e - s, sub):
+            a, b = _texts(txt, df.slice(s + s2, e2 - s2))
+            ce[s2:e2] = scorer(a, b)
+        tmp = part.with_suffix(".tmp")
+        df.slice(s, e - s).select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(tmp)
+        tmp.rename(part)  # atomic: a killed worker never leaves a half-written part that looks finished
         log().info("   CE half %d %s: %d/%d pairs scored", half, split, e, df.height)
-    out = ensure_dir(work_dir(cfg, split, "preds")) / f"ce_half{half}.parquet"
-    df.select(["s1_uid", "rec_uid"]).with_columns(pl.Series("ce", ce)).write_parquet(out)
+    parts = sorted(pdir.glob("part_*.parquet"))
+    res = pl.read_parquet(parts) if parts else df.select(["s1_uid", "rec_uid"]).with_columns(pl.lit(0.0, pl.Float32).alias("ce"))
+    tmp = out.with_suffix(".tmp")
+    res.write_parquet(tmp)
+    tmp.rename(out)
+    save_json(plan, done)
+    shutil.rmtree(pdir, ignore_errors=True)
     return out
 
 
@@ -256,9 +299,11 @@ def merge_halves(cfg, split: str) -> None:
     expected = band(cfg, split).height
     if merged.height != expected:
         raise RuntimeError(f"CE {split}: {merged.height} scored pairs but the band has {expected}; check folds.neural_halves")
-    merged.write_parquet(pdir / "ce_part000.parquet")
+    merged.write_parquet(pdir / "ce_part000.tmp")
+    (pdir / "ce_part000.tmp").rename(pdir / "ce_part000.parquet")  # its existence marks the split as scored
     for h in (0, 1):
         (pdir / f"ce_half{h}.parquet").unlink(missing_ok=True)
+        (pdir / f"ce_half{h}.json").unlink(missing_ok=True)
     log().info("  CE %s: merged the two halves -> %d scored pairs", split, merged.height)
 
 

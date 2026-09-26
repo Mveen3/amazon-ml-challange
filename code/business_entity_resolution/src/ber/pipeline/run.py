@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from ..config import load_config
 from ..progress import ORDER, plan_from_cfg, report, session_from_env
 from ..utils import inference_only, log, mark_done, save_json, set_seed, stage_done, timer, work_dir
 
+EXIT_OOM = 75  # stage ran out of memory (Python MemoryError); the Kaggle runner retries with lower-memory settings
 PIPELINE = list(ORDER)  # single source of truth: ber.progress.ORDER
 EXTRA = ["s1s1", "stress_check"]
 SPLITS = ("train", "test")
@@ -105,6 +107,10 @@ def run_stage(cfg, stage: str, args) -> dict | None:
 
         from ..blocking.candidates import union_dir
         from ..blocking.prerank import run_prerank
+        if args.force:  # --force means retrain: drop models / scores kept for resuming an interrupted attempt
+            for f in [work_dir(cfg, None, "models", "prerank", "trained.json")] + \
+                     [work_dir(cfg, sp, "cands", "pre_all.json") for sp in SPLITS]:
+                f.unlink(missing_ok=True)
         run_prerank(cfg)
         if cfg.run.get("cleanup", False):  # the union files are only read by the pre-ranker
             for s in _splits(args):
@@ -116,6 +122,8 @@ def run_stage(cfg, stage: str, args) -> dict | None:
     elif stage == "features":
         from ..features.pair import run_features
         for s in _splits(args):
+            if args.force:  # --force means recompute: drop the plan that lets an interrupted attempt keep its shards
+                work_dir(cfg, s, "feats", "r1_plan.json").unlink(missing_ok=True)
             run_features(cfg, s)
     elif stage == "r1":
         from ..models.rounds import run_r1
@@ -138,19 +146,31 @@ def run_stage(cfg, stage: str, args) -> dict | None:
     elif stage == "ce_infer":
         if not cfg.ce.enabled:
             return None
+        import shutil
+
         from ..checkpoint import sync_now
         from ..models import ce_parallel
-        from ..models.cross_encoder import infer
+        from ..models.cross_encoder import infer, infer_half, merge_halves
         i, n = (int(x) for x in (args.shard or "0/1").split("/"))
         for s in _splits(args):
-            if work_dir(cfg, s, "preds", f"ce_part{i:03d}.parquet").exists() and not args.force:
+            if args.force:  # recompute: drop scores kept for resuming an interrupted attempt
+                for h in (0, 1):
+                    for f in ("parquet", "json"):
+                        work_dir(cfg, s, "preds", f"ce_half{h}.{f}").unlink(missing_ok=True)
+                    shutil.rmtree(work_dir(cfg, s, "preds", f"ce_half{h}_parts"), ignore_errors=True)
+            elif work_dir(cfg, s, "preds", f"ce_part{i:03d}.parquet").exists():
                 log().info("  CE %s shard %d/%d already scored (restored or earlier run)", s, i, n)
                 continue
-            if (i, n) == (0, 1) and ce_parallel.usable(cfg) and ce_parallel.infer_halves(cfg, s):
-                sync_now(f"cross-encoder scores for {s} (one half per GPU)")
+            if (i, n) == (0, 1):
+                if not (ce_parallel.usable(cfg) and ce_parallel.infer_halves(cfg, s)):
+                    for h in (0, 1):  # one GPU, or a worker failed: the halves one after the other (resumable too)
+                        infer_half(cfg, s, h)
+                        sync_now(f"cross-encoder half {h} scored {s}")
+                    merge_halves(cfg, s)
+                sync_now(f"cross-encoder scores for {s}")
                 continue
-            infer(cfg, s, i, n)
-            sync_now(f"cross-encoder scores for {s}")
+            infer(cfg, s, i, n)  # explicit --shard i/n (several machines): not resumable within a shard
+            sync_now(f"cross-encoder scores for {s} shard {i}/{n}")
     elif stage == "r2":
         from ..models.rounds import run_r2
         run_r2(cfg)
@@ -234,29 +254,21 @@ def main(argv=None) -> None:
         if st not in ("predict", "outputs") and not args.force and not args.probe and stage_done(cfg, st, marker_split):
             log().info("⏭  %s already done (use --force to re-run)", st)
             continue
+        # A stage being (re-)run is not done until it finishes: if this attempt dies half-way, a stale marker from an
+        # earlier completion must not make the next run skip it (its outputs may be half replaced by now).
+        work_dir(cfg, None, "_markers", f"{st}.{marker_split or 'all'}.done").unlink(missing_ok=True)
         t0 = time.time()
         try:
             with timer(f"stage {st}"):
                 info = run_stage(cfg, st, args)
-        except Exception as exc:
-            # ── crash recovery: pull whatever was last pushed to HF and retry once ──
-            log().warning("  stage %s failed (%s: %s); attempting HF crash recovery …",
-                          st, type(exc).__name__, str(exc).splitlines()[0][:200])
-            try:
-                from ..checkpoint import force_restore_now
-                force_restore_now()
-            except Exception as re_exc:
-                log().warning("  crash recovery download failed (%s); re-raising original error", re_exc)
-                raise exc from None
-            # If the stage is now done (sub-stage progress covered everything), skip the retry
-            if stage_done(cfg, st, marker_split):
-                log().info("  crash recovery: stage %s is now complete after restore — no retry needed", st)
-                info = None
-            else:
-                log().info("  crash recovery: retrying stage %s with restored sub-stage progress …", st)
-                t0 = time.time()
-                with timer(f"stage {st} (retry)"):
-                    info = run_stage(cfg, st, args)
+        except MemoryError:
+            # Out of memory raised inside Python (rather than the kernel killing the process). The local work dir
+            # is intact and finished sub-steps are kept; exit with a dedicated code so the Kaggle runner repeats the
+            # stage with lower-memory settings.
+            log().error("  stage %s ran out of memory -> exit %d (the runner retries with lower-memory settings)",
+                        st, EXIT_OOM)
+            ckpt.sync(f"stage {st} interrupted (out of memory): partial progress")
+            sys.exit(EXIT_OOM)
         mark_done(cfg, st, marker_split, {"seconds": round(time.time() - t0, 1), "info": info})
         ckpt.sync(f"stage {st} done")  # outputs + completion marker in one commit
         show_progress()

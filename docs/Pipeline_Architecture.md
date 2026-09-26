@@ -711,6 +711,29 @@ Full-scale runtime on Kaggle is not yet measured. The notebook reports the sessi
 
 **Multi-GPU.** The cross-encoder is wrapped so that DataParallel gathers plain logit tensors. This removes any dependence on how a given transformers version structures its model outputs (Kaggle ships transformers 5.x).
 
+**Out-of-memory fix and mid-stage resume (26 Sep).**
+
+*What happened.* The first full Kaggle run finished `block` (2 h 37 min; train ceiling 0.99687, pair recall 0.9896, 81 pairs per S1), then was killed twice in `prerank` (exit -9).
+
+*Cause.* A fixed sample of 400k entities meant 32.6M training rows at full scale (vs ~55 pairs per S1 on the sample). Two folds trained at once, each with its own ~3 GB copy, while the ~4 GB norm table was still held.
+
+*Fixes:*
+- Every GBDT training sample is capped by rows as well as entities (`prerank/r1/r2.max_train_rows`).
+- Memory is freed before fold training.
+- Folds train concurrently only if both copies fit in half the free RAM.
+- The Kaggle runner repeats a stage killed for memory with lower-memory settings, in the same session and without a checkpoint re-download.
+
+*Mid-stage resume.* The long stages resume from their last finished piece rather than from the stage start:
+- prerank models and scored chunks
+- feature shards
+- cross-encoder halves and scored parts
+
+Each piece is written atomically and reused only when its plan matches (row counts, chunk sizes, model id). Pieces reach the Hugging Face checkpoint while the stage runs.
+
+*Verification.* Killing a run mid-stage (exit 137) and re-running gives outputs byte-identical to an uninterrupted run. This was checked on the 5k sample for prerank, features and cross-encoder scoring. The cross-encoder check covered the sequential path, the per-GPU workers and a crashed fallback, using a stub scorer.
+
+*Determinism fix.* Features had a last-bit nondeterminism across processes: iteration over Python sets depends on the per-process hash seed. Fixed by sorting. Sample scores are unchanged: OOF 0.99687, pseudo-test 0.99802.
+
 ## 15. Timeline (IST)
 
 Workstreams: **A** = data, blocking and features (critical path, CPU box). **B** = neural (GPU box). **C** = validation, decision and submissions. If working solo, A and C come first, and B runs in the background.
