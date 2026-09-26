@@ -43,6 +43,10 @@ sample data: it reproduces the full run's outputs byte for byte.
 4. `configs/track_f.yaml`: inference-only, test features recomputed with the France adaptations and re-scored with
    the trained models (starts from `features`). Its outputs and models bundle are the final submission.
 
+Tracks 3 and 4 run in one Kaggle session: notebook `CONFIG = "configs/track_g.yaml"`,
+`THEN_CONFIG = "configs/track_f.yaml"`. Track G's files end up in `/kaggle/working/track_g/`, Track F's at the top
+level.
+
 On sample data this chain gives a `matching_results.tsv` / `candidate_pairs.tsv` byte-identical to one
 from-scratch `final.yaml` run. On the full data the one difference is that the chain reuses the cross-encoder
 scores of the first run (their score band came from the 500k-entity round 1).
