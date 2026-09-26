@@ -401,3 +401,40 @@ class KaggleRun:
         for p in sorted(self.working.iterdir()):
             size = sum(f.stat().st_size for f in p.rglob('*') if f.is_file()) if p.is_dir() else p.stat().st_size
             print(f"{size / 1e6:10.1f} MB  {p}")
+
+    # ------------------------------------------------------------------ next track in the same session
+    # the stage groups of the notebook's full-run cells
+    FULL_RUN = ["ingest,eda,mine,normalize", "block", "prerank,expand", "features", "r1", "ce_train,ce_infer",
+                "r2,gate,tune,predict,outputs"]
+
+    def full_run(self) -> None:
+        for stages in self.FULL_RUN:
+            self.stage(stages)
+        self.results()
+        self.package()
+
+    def then(self, config: str) -> "KaggleRun":
+        """Start the next track in this session, after this one has finished (every stage is on Hugging Face).
+        This run's files move to /kaggle/working/<config stem>/, so the next track writes the top-level ones; this
+        run's work dir is deleted to free the disk, and the next track restores its bases into a new one."""
+        if not self.use_ckpt:
+            raise RuntimeError("THEN_CONFIG needs HF checkpoints: the next track restores this one from Hugging Face")
+        dest = self.working / Path(self.config).stem
+        dest.mkdir(exist_ok=True)
+        for pat in ("matching_results.tsv", "candidate_pairs.tsv", "*_submission.zip", "*_models.tar.gz",
+                    "reports", "logs"):
+            for p in self.working.glob(pat):
+                shutil.move(str(p), str(dest / p.name))
+        print(f"{self.config}: files moved to {dest}")
+        if self.work_dir and self.work_dir.exists():
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+        nxt = KaggleRun(pkg=self.pkg, config=config, dataset_slug=self.slug, team=self.team,
+                        use_cross_encoder=self.use_ce, use_hf_checkpoint=True, fresh_start=False,
+                        overrides=self.overrides, working=self.working, input_root=self.input_root,
+                        scratch=self.scratch_override)
+        nxt.t0 = self.t0  # same Kaggle session clock
+        nxt.scratch, nxt.data_dir = self.scratch, self.data_dir
+        nxt.work_dir = self.scratch / f"ber_work_{Path(nxt.config).stem}"
+        nxt.secrets()
+        print(f"next track: {nxt.config} | work dir {nxt.work_dir} | session time used: {nxt._hours()}")
+        return nxt
