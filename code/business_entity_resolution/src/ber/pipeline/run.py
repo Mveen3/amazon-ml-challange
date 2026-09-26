@@ -238,6 +238,12 @@ def main(argv=None) -> None:
         stages = stages + extra
     from ..checkpoint import activate
     ckpt = activate(cfg)
+    if cfg.checkpoint.get("restore_from") and not ckpt.enabled:
+        # A track only makes sense on top of its base run's checkpoint. Without Hugging Face access it would
+        # silently rebuild everything from scratch (about 11 GPU hours): stop now instead.
+        raise SystemExit("this config is a track (checkpoint.restore_from is set) but the Hugging Face checkpoint "
+                         "is not reachable (HF_TOKEN secret missing or no internet): add the HF_TOKEN Secret to the "
+                         "notebook (Add-ons -> Secrets) and run again")
     if args.fresh_start:
         ckpt.reset()
     ckpt.restore()  # new session: pull finished stages from Hugging Face, so they are skipped below

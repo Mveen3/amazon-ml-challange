@@ -1,0 +1,29 @@
+{
+  "datasets": {
+    "amazon-ml": {
+      "local_path": "dataset/",
+      "slug": "mveen3/amazon-ml",
+      "url": "https://www.kaggle.com/datasets/mveen3/amazon-ml",
+      "mount_path": "/kaggle/input/amazon-ml (newer images: /kaggle/input/datasets/mveen3/amazon-ml)",
+      "files": {
+        "dataset/train/train_source1.tsv": 210069713,
+        "dataset/train/train_source2.tsv": 489301488,
+        "dataset/train/train_source3.tsv": 503705637,
+        "dataset/train/train_ground_truth.tsv": 127015583,
+        "dataset/test/test_source1.tsv": 175022086,
+        "dataset/test/test_source2.tsv": 509456422,
+        "dataset/test/test_source3.tsv": 506002772
+      },
+      "last_upload": "2026-09-25",
+      "verified": "2026-09-27: names and sizes match the local files (kaggle datasets files)"
+    }
+  },
+  "kernels": {
+    "pipeline": {
+      "slug": "mveen3/amazon",
+      "url": "https://www.kaggle.com/code/mveen3/amazon",
+      "folder": "code/business_entity_resolution/kaggle/",
+      "note": "reuse this slug for every run (keeps the HF_TOKEN Secret); select the track with CONFIG in the notebook"
+    }
+  }
+}
