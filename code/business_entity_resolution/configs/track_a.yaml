@@ -1,0 +1,35 @@
+# Track A (improvement.md): Kaggle GPU session (T4 x2), about 3 h.
+# Restores the finished run from the Hugging Face folder 'full' (features, candidates, cross-encoder scores) and
+# re-does r1 -> r2 -> gate -> tune -> predict -> outputs with:
+#   * matchers trained on 800k entities instead of 500k (about 8.6M rows; memory measured per row on the sample:
+#     about 15-18 GB per fold, folds train one at a time; the out-of-memory retry steps back to the old 500k),
+#   * the new decision layer (expected-F0.5 rule + wider threshold grid),
+#   * the error analysis at the end.
+# The cross-encoder scores are reused (its stages are not re-run): its score band moves slightly with the new r1,
+# and pairs outside the old band simply have no cross-encoder score, in train and test alike.
+# Progress goes to its own folder 'track_a'; the 'full' folder is only read, never changed.
+inherit: kaggle.yaml
+
+run:
+  extra_stages: [errors]
+
+checkpoint:
+  prefix: track_a
+  restore_from: full
+  start_from: r1
+  keep_stages: [ce_train, ce_infer]
+  restore_ignore: ["*/cands/union/*", "*/vec/*", "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*",
+                   "models/ce/*"]
+
+r1:
+  sample_entities: 800000
+  max_train_rows: 9000000
+  gbdt: {max_entities: 800000}
+
+r2:
+  sample_entities: 800000
+  max_train_rows: 9000000
+  gbdt: {max_entities: 800000}
+
+stress:
+  enabled: false

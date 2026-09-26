@@ -7,6 +7,7 @@ paths:
   validator: ../../utils/validate_submission.py
 
 run:
+  extra_stages: []               # stages run after outputs, e.g. [errors] (error analysis, CPU only)
   seed: 42
   n_workers: -1                  # -1 = all cores
   cleanup: false                 # delete bulky intermediates once consumed (candidate-union files)
@@ -22,6 +23,10 @@ checkpoint:                      # mirror the work dir to a PRIVATE Hugging Face
   exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*.tmp", "*.tmp/*", "rp_matrix.npy", "_last_config.json",
             "*/vec/*/comb_rp.npy", "*/vec/*/addr_rp.npy"]   # vectors: big and deterministic, rebuilt on demand
   # pre-ranker chunk parts (cands/pre_parts) and feature shards ARE checkpointed: long stages resume mid-way
+  restore_from: null             # track mode: folder of a finished run to start from (read only)
+  start_from: null               # stage the track re-does from; base outputs of it and later stages are skipped
+  keep_stages: []                # later stages whose base outputs the track keeps (e.g. [ce_train, ce_infer])
+  restore_ignore: []             # extra base files a track does not need (saves download time)
 
 ingest:
   train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
@@ -153,8 +158,15 @@ decision:
   t_add_base: [0.727, 0.727, 0.759, 0.771, 0.778, 0.782, 0.785, 0.787, 0.789, 0.790, 0.791, 0.792]
   grid:
     kappa: [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2]
-    t_min: [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
+    t_min: [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]   # optimum was at 0.02, the old lower edge
     delta: [-0.35, -0.3, -0.25, -0.2, -0.15, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15]
+  expected:                      # expected-F0.5 set choice (decision/expected.py); used where it beats the grid rule
+    enabled: true
+    a: [0.8, 1.0, 1.25]          # sharpness of the member probabilities (logit scale)
+    b: [-0.5, 0.0, 0.5]          # bias on the logit (> 0 predicts more members)
+    u: [0.0, 0.1]                # expected true matches outside the candidate list (Poisson mean)
+    cond: [true]                 # member probabilities conditioned on the gate's P(has a match)
+    min_gain: 0.0001             # switch rules only for a clear out-of-fold gain (no noise-level switches)
   overrides: {}                  # probes, e.g. {france: {delta_shift: 0.05}} or {france: {empty: true}}
 
 stress:

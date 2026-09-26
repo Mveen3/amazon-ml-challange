@@ -124,6 +124,15 @@ Any folder layout inside the zip works. The notebook finds the 7 TSV files where
   Each piece is written atomically: to a `.tmp` file first, then renamed. A *plan* file records row counts, chunk sizes and the model id, and a piece is reused only when its plan matches. So a crash never leaves a half-written piece that looks finished, and scores from another model or chunk size are never mixed in.
 - **Resuming:** if a session stops (12-hour limit, crash, lost connection), commit the notebook again (**Save & Run All**). The first stage call finds an empty work dir, downloads the checkpoint, prints `restored … finished stages: …`, skips those stages and continues inside the interrupted stage from its last saved piece.
 - **Out of memory:** if a stage is killed for memory (exit -9/137, -6/134, or 75 from a Python `MemoryError`), the notebook repeats it at once in the same session with lower-memory settings (`LOW_MEMORY_LEVELS` in `scripts/kaggle_runner.py`, two levels). The retry uses fold models one at a time, smaller training samples and fewer workers. The local work dir is intact, so the retry continues where the killed attempt stopped, with no re-download. Separately, fold models train concurrently only when both copies fit in half the free RAM.
+- **Tracks (experiments on top of a finished run):** a track config sets `checkpoint.restore_from` (the finished run's
+  folder, e.g. `full`, only ever read) and `checkpoint.start_from` (the first stage to re-do).
+  - The track restores that run's outputs of the earlier stages only, plus any `keep_stages`. Outputs, resume
+    state and completion markers of the re-done stages are never restored, so a re-done stage cannot pick up the
+    old results.
+  - It writes its own progress to its own folder (`checkpoint.prefix`) and resumes from there after a crash.
+  - Ready-made tracks: `configs/track0.yaml` (CPU session: new decision layer + error analysis) and
+    `configs/track_a.yaml` (GPU: matchers re-trained from `r1`). Select one with `CONFIG` in the notebook.
+  - Two tracks with different prefixes can run at the same time on two accounts.
 - **Fresh start:** `FRESH_START = True` deletes the saved progress and starts over. Use it after changing code or settings that affect earlier stages, otherwise stale restored stages are reused.
 - **Safety:** the code refuses to upload to a **public** repo, because the checkpoint contains competition-derived data. It reads only `HF_TOKEN` and never prints it.
 - **Failures:** an upload failure is logged and retried after the next stage. A missing token just turns checkpointing off.

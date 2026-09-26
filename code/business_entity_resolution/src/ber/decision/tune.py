@@ -16,6 +16,7 @@ import polars as pl
 from ..eval.metric import report
 from ..models.gate import ownership
 from ..utils import inference_only, load_json, log, save_json, work_dir
+from .expected import select_expected
 from .select import build_arrays, entity_f05, select_mask, selected_pairs
 
 
@@ -29,10 +30,34 @@ def load_arrays(cfg, split: str, r2: pl.DataFrame | None = None, gate: pl.DataFr
     return build_arrays(ownership(r2.sort(["s1_uid", "rec_uid"])), gate.sort("s1_uid"), int(cfg.decision.max_members))
 
 
+def _select(arr: dict, m: np.ndarray, th: dict, cfg) -> np.ndarray:
+    """Selection for the rows ``m`` under one threshold set (heuristic rule or expected-F0.5 rule)."""
+    if th.get("rule") == "expected":
+        return select_expected(arr["Q"][m], arr["SRC"][m], arr["G"][m], _caps(cfg), th["a"], th["b"], th["u"],
+                               bool(th["cond"]))
+    return select_mask(arr["Q"][m], arr["SRC"][m], arr["G"][m], th["kappa"], th["t_min"], th["delta"],
+                       cfg.decision.t_add_base, _caps(cfg))
+
+
 def _score(arr: dict, m: np.ndarray, th: dict, cfg) -> float:
-    sel = select_mask(arr["Q"][m], arr["SRC"][m], arr["G"][m], th["kappa"], th["t_min"], th["delta"],
-                      cfg.decision.t_add_base, _caps(cfg))
-    return float(entity_f05(sel, arr["Y"][m], arr["NTRUE"][m]).mean())
+    return float(entity_f05(_select(arr, m, th, cfg), arr["Y"][m], arr["NTRUE"][m]).mean())
+
+
+def _search_expected(cfg, arr: dict, prof: str, arr_stress: dict | None) -> dict | None:
+    """Grid over the expected-F0.5 rule's knobs (improvement.md A4); None when switched off."""
+    ec = cfg.decision.get("expected") or {}
+    if not ec.get("enabled", False):
+        return None
+    m = arr["PROF"] == prof
+    ms = arr_stress["PROF"] == prof if arr_stress is not None else None
+    best = None
+    for a, b, u, cond in itertools.product(ec.a, ec.b, ec.u, ec.cond):
+        th = {"rule": "expected", "a": float(a), "b": float(b), "u": float(u), "cond": bool(cond)}
+        f = _score(arr, m, th, cfg)
+        fs = _score(arr_stress, ms, th, cfg) if arr_stress is not None else f
+        if best is None or min(f, fs) > best["objective"]:
+            best = {**th, "objective": min(f, fs), "f_normal": f, "f_stress": fs}
+    return best
 
 
 def search(cfg, arr: dict, prof: str, arr_stress: dict | None = None) -> dict:
@@ -46,8 +71,16 @@ def search(cfg, arr: dict, prof: str, arr_stress: dict | None = None) -> dict:
         fs = _score(arr_stress, ms, th, cfg) if arr_stress is not None else f
         obj = min(f, fs)
         if best is None or obj > best["objective"]:
-            best = {**th, "objective": obj, "f_normal": f, "f_stress": fs}
-    log().info("  tuned %s: %s", prof, {k: round(v, 5) for k, v in best.items()})
+            best = {**th, "rule": "heuristic", "objective": obj, "f_normal": f, "f_stress": fs}
+    log().info("  tuned %s (heuristic rule): %s", prof, {k: round(v, 5) for k, v in best.items() if k != "rule"})
+    exp = _search_expected(cfg, arr, prof, arr_stress)
+    if exp is not None:
+        log().info("  tuned %s (expected-F0.5 rule): %s", prof,
+                   {k: (round(v, 5) if isinstance(v, float) else v) for k, v in exp.items() if k != "rule"})
+        if exp["objective"] > best["objective"] + float(cfg.decision.expected.get("min_gain", 0.0)):
+            log().info("  %s: expected-F0.5 rule wins (+%.5f on train out-of-fold)", prof,
+                       exp["objective"] - best["objective"])
+            return {**exp, "heuristic": best}
     return best
 
 
@@ -63,6 +96,16 @@ def run_tune(cfg, arr_stress: dict | None = None) -> dict:
 def thresholds_for(cfg, th: dict, prof: str) -> dict:
     base = dict(th.get(prof) or th[th["_fallback"]])
     ov = (cfg.decision.get("overrides") or {}).get(prof, {}) or {}
+    if ov.get("rule") == "heuristic" and "heuristic" in base:  # probe: fall back to the heuristic rule
+        base = dict(base["heuristic"])
+    if base.get("rule") == "expected":
+        for k in ("a", "b", "u"):
+            if k in ov:
+                base[k] = float(ov[k])
+        base["b"] = base["b"] + float(ov.get("b_shift", 0.0))  # > 0 predicts more, < 0 fewer
+        if ov.get("empty", False):
+            base = {"rule": "heuristic", "kappa": 0.0, "t_min": 1.0, "delta": 0.0}
+        return base
     for k in ("kappa", "t_min", "delta"):
         if k in ov:
             base[k] = float(ov[k])
@@ -76,9 +119,7 @@ def apply(cfg, arr: dict, th: dict) -> pl.DataFrame:
     sel = np.zeros_like(arr["Q"], dtype=bool)
     for prof in sorted(set(arr["PROF"].tolist())):
         m = arr["PROF"] == prof
-        t = thresholds_for(cfg, th, prof)
-        sel[m] = select_mask(arr["Q"][m], arr["SRC"][m], arr["G"][m], t["kappa"], t["t_min"], t["delta"],
-                             cfg.decision.t_add_base, _caps(cfg))
+        sel[m] = _select(arr, m, thresholds_for(cfg, th, prof), cfg)
     return selected_pairs(arr, sel)
 
 

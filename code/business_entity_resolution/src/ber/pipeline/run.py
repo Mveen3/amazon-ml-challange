@@ -24,11 +24,11 @@ from ..utils import inference_only, log, mark_done, save_json, set_seed, stage_d
 
 EXIT_OOM = 75  # stage ran out of memory (Python MemoryError); the Kaggle runner retries with lower-memory settings
 PIPELINE = list(ORDER)  # single source of truth: ber.progress.ORDER
-EXTRA = ["s1s1", "stress_check"]
+EXTRA = ["s1s1", "stress_check", "errors"]
 SPLITS = ("train", "test")
 
 
-TRAIN_ONLY = {"eda", "mine", "ce_train", "tune", "s1s1", "stress_check"}
+TRAIN_ONLY = {"eda", "mine", "ce_train", "tune", "s1s1", "stress_check", "errors"}
 _CFG = None
 
 
@@ -195,6 +195,9 @@ def run_stage(cfg, stage: str, args) -> dict | None:
     elif stage == "outputs":
         from ..pipeline.outputs import write_outputs
         write_outputs(cfg, args.probe)
+    elif stage == "errors":
+        from ..eval.errors import run_errors
+        return run_errors(cfg)
     elif stage == "s1s1":
         from ..eval.s1s1 import run_s1s1
         return run_s1s1(cfg)
@@ -230,6 +233,9 @@ def main(argv=None) -> None:
         stages = PIPELINE
     else:
         stages = [s.strip() for s in args.stage.split(",")]
+    extra = [s for s in (cfg.run.get("extra_stages") or []) if s not in stages]
+    if extra and "outputs" in stages:  # e.g. run.extra_stages: [errors] -> error analysis after the outputs
+        stages = stages + extra
     from ..checkpoint import activate
     ckpt = activate(cfg)
     if args.fresh_start:
@@ -251,7 +257,7 @@ def main(argv=None) -> None:
             continue
         per_split = args.split not in (None, "both")
         marker_split = args.split if per_split else None
-        if st not in ("predict", "outputs") and not args.force and not args.probe and stage_done(cfg, st, marker_split):
+        if st not in ("predict", "outputs", "errors") and not args.force and not args.probe and stage_done(cfg, st, marker_split):
             log().info("⏭  %s already done (use --force to re-run)", st)
             continue
         # A stage being (re-)run is not done until it finishes: if this attempt dies half-way, a stale marker from an

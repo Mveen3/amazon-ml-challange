@@ -10,13 +10,14 @@ entity), so downstream stages see the full candidate graph.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable
 
 import polars as pl
 
-from ..utils import log, work_dir
-from .gbdt import GBDT, predict_by_fold, to_matrix
+from ..utils import gpu_cap, log, work_dir
+from .gbdt import GBDT, predict_by_fold, to_matrix, xgb_gpu_available
 
 KEYS = ["s1_uid", "rec_uid"]
 
@@ -80,15 +81,52 @@ def predict_shards(paths: list[Path], models: list[GBDT], features: list[str], k
     """
     avail = set(columns_of(paths))
     read = [c for c in dict.fromkeys(list(keep_cols) + list(features) + ["fold"]) if c in avail]
-    out = []
-    for i, p in enumerate(paths):
-        df = pl.read_parquet(p, columns=read)
+    sets = _device_model_sets(models)
+    done = [0]
+
+    def score(i: int, ms: list[GBDT]) -> pl.DataFrame | None:
+        df = pl.read_parquet(paths[i], columns=read)
         if transform is not None:
             df = transform(df)
         if df.height == 0:
-            continue
-        pred = predict_by_fold(models, to_matrix(df, features), df["fold"].to_numpy())
-        out.append(df.select([c for c in keep_cols if c in df.columns]).with_columns(pl.Series("pred", pred)))
-        if (i + 1) % max(1, len(paths) // 10) == 0:
-            log().info("   scored %d/%d shards", i + 1, len(paths))
-    return pl.concat(out).sort(KEYS)
+            return None
+        pred = predict_by_fold(ms, to_matrix(df, features), df["fold"].to_numpy())
+        done[0] += 1
+        if done[0] % max(1, len(paths) // 10) == 0:
+            log().info("   scored %d/%d shards", done[0], len(paths))
+        return df.select([c for c in keep_cols if c in df.columns]).with_columns(pl.Series("pred", pred))
+
+    if len(sets) == 1:
+        out = [score(i, models) for i in range(len(paths))]
+    else:  # shards split across GPUs: one thread and one model copy per GPU (xgboost releases the GIL)
+        from concurrent.futures import ThreadPoolExecutor
+
+        log().info("   scoring %d shards on %d devices at once", len(paths), len(sets))
+        with ThreadPoolExecutor(len(sets)) as ex:
+            futs = [ex.submit(lambda g: [(i, score(i, sets[g])) for i in range(g, len(paths), len(sets))], g)
+                    for g in range(len(sets))]
+            res = dict(pair for f in futs for pair in f.result())
+        out = [res[i] for i in range(len(paths))]
+    return pl.concat([o for o in out if o is not None]).sort(KEYS)
+
+
+def _device_model_sets(models: list[GBDT]) -> list[list[GBDT]]:
+    """One copy of the fold models per GPU for parallel scoring (XGBoost with >= 2 GPUs); otherwise [models].
+
+    ``BER_SCORE_DEVICES`` (e.g. ``cpu,cpu``) forces a split on other devices (used to test the threaded path).
+    """
+    forced = os.environ.get("BER_SCORE_DEVICES")
+    if forced:
+        devices = [d.strip() for d in forced.split(",") if d.strip()]
+    else:
+        if not models or models[0].backend != "xgboost" or not xgb_gpu_available():
+            return [models]
+        import torch
+
+        n = torch.cuda.device_count()
+        if gpu_cap() > 0:
+            n = min(n, gpu_cap())
+        devices = [f"cuda:{g}" for g in range(n)]
+    if len(devices) < 2 or models[0].backend != "xgboost":
+        return [models]
+    return [[m.on_device(d) for m in models] for d in devices]

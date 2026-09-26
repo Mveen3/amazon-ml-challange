@@ -23,7 +23,10 @@ from pathlib import Path
 SMOKE_SETS = ["mining.min_support=3", "blocking.keyblock.admin_df_min=5", "blocking.keyblock.admin_df_max=3000",
               "prerank.chunk_rows=50000", "features.shard_rows=3000", "features.join_rows=10000",
               "ce.max_pos=3000", "ce.infer_chunk=5000",
-              "blocking.knn.mem_gb=0.002"]  # tiny kNN memory budget -> many small query chunks, so both GPUs get work
+              "blocking.knn.mem_gb=0.002",  # tiny kNN memory budget -> many small query chunks, so both GPUs get work
+              # the rehearsal is a self-contained run: with a track config it must never restore the full-data
+              # base folder into the sample work dir
+              "checkpoint.prefix=smoke-test", "checkpoint.restore_from=null", "checkpoint.start_from=null"]
 
 
 def q(x) -> str:
@@ -40,11 +43,11 @@ OOM_EXIT_CODES = (-9, 137, -6, 134, 75)
 # are part of the resume plans (changing them would throw away finished sub-steps).
 _SEQUENTIAL_FOLDS = [f"{s}.gbdt.parallel_folds=false" for s in ("prerank", "r1", "r2", "gate")]
 LOW_MEMORY_LEVELS = [
-    _SEQUENTIAL_FOLDS + ["prerank.max_train_rows=6000000", "r1.sample_entities=300000", "r2.sample_entities=300000",
-                         "r1.max_train_rows=5000000", "r2.max_train_rows=5000000",
+    _SEQUENTIAL_FOLDS + ["prerank.max_train_rows=6000000", "r1.sample_entities=500000", "r2.sample_entities=500000",
+                         "r1.max_train_rows=6000000", "r2.max_train_rows=6000000",
                          "ce.parallel_halves=false", "ce.infer_chunk=250000"],
-    _SEQUENTIAL_FOLDS + ["prerank.max_train_rows=3000000", "r1.sample_entities=150000", "r2.sample_entities=150000",
-                         "r1.max_train_rows=3000000", "r2.max_train_rows=3000000",
+    _SEQUENTIAL_FOLDS + ["prerank.max_train_rows=3000000", "r1.sample_entities=300000", "r2.sample_entities=300000",
+                         "r1.max_train_rows=4000000", "r2.max_train_rows=4000000",
                          "ce.parallel_halves=false", "ce.infer_chunk=100000", "run.n_workers=2"],
 ]
 
@@ -290,7 +293,7 @@ class KaggleRun:
         shutil.rmtree(sd, ignore_errors=True)  # stale stage markers would silently skip stages
         self.sh(f"cd {q(self.pkg)} && {q(sys.executable)} scripts/make_sample.py --data {q(self.data_dir)} "
                 f"--out {q(sd / 'sample_data')}")
-        sets = self._sets(f"{sd}/sample_data", f"{sd}/work", f"{sd}/output") + SMOKE_SETS + ["checkpoint.prefix=smoke-test"]
+        sets = self._sets(f"{sd}/sample_data", f"{sd}/work", f"{sd}/output") + SMOKE_SETS
         log_file = self.logs / "smoke.log"
         start = log_file.stat().st_size if log_file.exists() else 0
         self.run("all", sets, log_name="smoke.log", fresh=True)
@@ -301,8 +304,7 @@ class KaggleRun:
             print("SMOKE TEST PASSED (no checkpoint round-trip: HF checkpoints are off).")
             return
         print("\n--- checkpoint round-trip: new empty work dir, same checkpoint -> restore and skip every stage ---")
-        sets2 = self._sets(f"{sd}/sample_data", f"{sd}/work_restored", f"{sd}/output_restored") + SMOKE_SETS + \
-            ["checkpoint.prefix=smoke-test"]
+        sets2 = self._sets(f"{sd}/sample_data", f"{sd}/work_restored", f"{sd}/output_restored") + SMOKE_SETS
         self.run("all", sets2, log_name="smoke.log")
         same = all((sd / "output" / f).read_bytes() == (sd / "output_restored" / f).read_bytes()
                    for f in ("matching_results.tsv", "candidate_pairs.tsv"))
@@ -351,7 +353,8 @@ class KaggleRun:
         reports = self.working / "reports"
         reports.mkdir(exist_ok=True)
         for f in ["oof_report.json", "thresholds.json", "stress_check.json", "prerank/floor.json",
-                  "r1/oof_metrics.json", "r2/oof_metrics.json", "gate/oof_metrics.json"]:
+                  "r1/oof_metrics.json", "r2/oof_metrics.json", "gate/oof_metrics.json",
+                  "error_analysis.md", "error_analysis.json", "decision/report.json"]:
             src = self.work_dir / "models" / f
             if src.exists():
                 shutil.copy(src, reports / f.replace("/", "_"))

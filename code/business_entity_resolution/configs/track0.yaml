@@ -1,0 +1,21 @@
+# Track 0 (improvement.md): a Kaggle CPU session is enough (no GPU hours used).
+# Restores the finished run from the Hugging Face folder 'full' and re-does only tune -> predict -> outputs with
+# the new decision layer (expected-F0.5 rule + wider threshold grid, each used only where it wins on train
+# out-of-fold), then writes the error analysis (models/error_analysis.md, copied to /kaggle/working/reports).
+# Progress goes to its own folder 'track0'; the 'full' folder is only read, never changed.
+inherit: kaggle.yaml
+
+run:
+  extra_stages: [errors]
+
+checkpoint:
+  prefix: track0
+  restore_from: full
+  start_from: tune
+  # base files this track never reads (saves download time and disk)
+  restore_ignore: ["*/feats/r1/*", "*/feats/r1_plan.json", "*/tokidf_*.pkl", "*/cands/union/*", "*/vec/*",
+                   "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*", "*/feats/r2_extras.parquet",
+                   "models/ce/*", "*/preds/ce_*", "*/preds/r1.parquet"]
+
+stress:
+  enabled: false                   # its orphan-cluster hypothesis is refuted by the data (improvement.md C7)

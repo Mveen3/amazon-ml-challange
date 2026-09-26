@@ -25,6 +25,44 @@ TOKEN_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN", "HUGGIN
 MANIFEST = ".hf_sync.json"  # local record of what the remote holds: relpath -> [size, mtime_ns]
 _ACTIVE: "Checkpointer | None" = None
 
+# Files each stage writes (fnmatch patterns relative to the work dir; ``*`` also matches ``/``). A *track* (a run that
+# re-does the stages from ``checkpoint.start_from`` on top of a finished run in ``checkpoint.restore_from``) restores
+# the base outputs of the earlier stages only, so a re-done stage can never pick up the base run's old outputs or its
+# resume state (plans, parts, shards).
+STAGE_FILES = {
+    "ingest": ["*/records.parquet", "*/s1.parquet", "*/truth.parquet"],
+    "eda": ["eda.json"],
+    "mine": ["tables.pkl", "_mining/*"],
+    "normalize": ["*/norm.parquet"],
+    "dense": ["models/biencoder/*", "*/cands/dense*"],
+    "block": ["*/cands/union/*", "*/vec/*", "rp_matrix.npy"],
+    "prerank": ["models/prerank/fold*", "models/prerank/importance.json", "models/prerank/trained.json",
+                "models/prerank/floor.json", "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*"],
+    "expand": ["models/prerank/expand.json", "*/cands/final.parquet"],
+    "features": ["*/feats/r1/*", "*/feats/r1_plan.json", "*/tokidf_*.pkl"],
+    "r1": ["models/r1/*", "*/preds/r1.parquet"],
+    "ce_train": ["models/ce/*"],
+    "ce_infer": ["*/preds/ce_*"],
+    "r2": ["models/r2/*", "*/feats/r2_extras.parquet", "*/preds/r2.parquet"],
+    "gate": ["models/gate/*", "*/preds/gate.parquet"],
+    "tune": ["models/thresholds.json", "models/stress_check.json", "models/decision/*"],
+    "predict": ["*/preds/selected*", "models/oof_report*.json"],
+    "outputs": [],
+    "errors": ["models/error_analysis.*"],  # extra stage (run.extra_stages): always re-done by a track
+}
+
+
+def track_skip_patterns(start_from: str | None, keep: list[str] | tuple = ()) -> list[str]:
+    """Patterns of base files a track must NOT restore: outputs and markers of ``start_from`` and later stages."""
+    if not start_from:
+        return []
+    from .progress import ORDER
+
+    if start_from not in ORDER:
+        raise ValueError(f"checkpoint.start_from={start_from!r} is not a pipeline stage ({ORDER})")
+    redo = [s for s in ORDER[ORDER.index(start_from):] if s not in set(keep)] + ["errors"]
+    return [p for s in redo for p in STAGE_FILES.get(s, [])] + [f"_markers/{s}.*" for s in redo]
+
 
 def read_dotenv(start: Path, names: tuple[str, ...]) -> None:
     """Set ``names`` from the nearest ``.env`` in ``start`` or its parents (existing env vars win)."""
@@ -57,6 +95,13 @@ class Checkpointer:
         self.work = Path(cfg.paths.work_dir)
         self.prefix = str(cc.get("prefix", "full")).strip("/")
         self.exclude = list(cc.get("exclude", []))
+        # track mode: start from another run's folder (read only), write this run's progress to ``prefix``
+        base = cc.get("restore_from")
+        self.base = str(base).strip("/") if base else None
+        if self.base == self.prefix:
+            self.base = None
+        self.base_skip = (track_skip_patterns(cc.get("start_from"), list(cc.get("keep_stages") or []))
+                          + list(cc.get("restore_ignore") or [])) if self.base else []
         self.repo = None
         if not self.enabled:
             return
@@ -85,7 +130,9 @@ class Checkpointer:
             raise RuntimeError(f"Hugging Face repo {repo} is PUBLIC; refusing to upload competition-derived "
                                "files. Make it private (repo Settings) or set checkpoint.repo_id.")
         self.repo = repo
-        log().info("  checkpoint: private repo hf://datasets/%s, folder '%s'", repo, self.prefix)
+        log().info("  checkpoint: private repo hf://datasets/%s, folder '%s'%s", repo, self.prefix,
+                   f" (track: starts from folder '{self.base}', re-does '{cc.get('start_from')}' onwards)"
+                   if self.base else "")
 
     # ------------------------------------------------------------------ local state
     def _excluded(self, rel: str) -> bool:
@@ -110,8 +157,8 @@ class Checkpointer:
         self.work.mkdir(parents=True, exist_ok=True)
         (self.work / MANIFEST).write_text(json.dumps(state))
 
-    def _remote_files(self) -> set[str]:
-        pre = self.prefix + "/"
+    def _remote_files(self, prefix: str | None = None) -> set[str]:
+        pre = (prefix or self.prefix) + "/"
         return {f[len(pre):] for f in self.api.list_repo_files(self.repo, repo_type="dataset") if f.startswith(pre)}
 
     # ------------------------------------------------------------------ operations
@@ -136,6 +183,11 @@ class Checkpointer:
         markers = self.work / "_markers"
         if markers.exists() and any(markers.iterdir()):
             return  # this session already has local progress
+        if self.base:
+            # track: the base run's outputs of the stages this track keeps, then the track's own progress on top
+            manifest = self._download_from_hf(prefix=self.base, ignore=self.base_skip, manifest={})
+            self._download_from_hf(manifest=manifest)
+            return
         self._download_from_hf()
 
     def force_restore(self) -> None:
@@ -149,25 +201,37 @@ class Checkpointer:
         log().info("  checkpoint: crash recovery — re-downloading latest HF state")
         self._download_from_hf()
 
-    def _download_from_hf(self) -> None:
-        """Download the remote checkpoint into the local work dir."""
-        remote = self._remote_files()
+    def _download_from_hf(self, prefix: str | None = None, ignore: list[str] | tuple = (),
+                          manifest: dict | None = None) -> dict:
+        """Download folder ``prefix`` (default: this run's) into the local work dir, skipping ``ignore`` patterns.
+
+        Returns and writes the manifest (files known to be on HF, so the next sync uploads only what is new or
+        changed). A track passes the manifest of its base download on to the download of its own folder.
+        """
+        prefix = prefix or self.prefix
+        manifest = {} if manifest is None else manifest
+        remote = [r for r in self._remote_files(prefix) if not any(fnmatch.fnmatch(r, p) for p in ignore)]
         if not remote:
-            log().info("  checkpoint: nothing saved yet -> starting from scratch")
-            return
+            log().info("  checkpoint: nothing saved yet in '%s'%s", prefix,
+                       "" if manifest else " -> starting from scratch")
+            if manifest:
+                self._write_manifest(manifest)
+            return manifest
         from huggingface_hub import snapshot_download
 
         t0 = time.time()
         stage = self.work.parent / f".hf_restore_{self.work.name}"
         shutil.rmtree(stage, ignore_errors=True)
-        snapshot_download(self.repo, repo_type="dataset", allow_patterns=[f"{self.prefix}/**"], local_dir=stage,
+        snapshot_download(self.repo, repo_type="dataset", allow_patterns=[f"{prefix}/**"],
+                          ignore_patterns=[f"{prefix}/{p}" for p in ignore] or None, local_dir=stage,
                           token=self._token, max_workers=8)
         n, size = 0, 0
-        src = stage / self.prefix
-        manifest = {}
-        for p in sorted(src.rglob("*")):
+        src = stage / prefix
+        for p in sorted(src.rglob("*")) if src.exists() else []:
             if p.is_file():
                 rel = p.relative_to(src).as_posix()
+                if any(fnmatch.fnmatch(rel, pat) for pat in ignore):
+                    continue  # defensive: never let a skipped base output reach the work dir
                 dst = self.work / rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(p, dst)
@@ -181,8 +245,9 @@ class Checkpointer:
         self._write_manifest(manifest)
         markers = self.work / "_markers"
         done = sorted(p.name.split(".")[0] for p in markers.glob("*.done")) if markers.exists() else []
-        log().info("  checkpoint: restored %d files (%.2f GB) in %.0fs; finished stages: %s", n, size / 1e9,
-                   time.time() - t0, ", ".join(done) or "none")
+        log().info("  checkpoint: restored %d files (%.2f GB) from '%s' in %.0fs; finished stages: %s", n,
+                   size / 1e9, prefix, time.time() - t0, ", ".join(done) or "none")
+        return manifest
 
     def sync(self, message: str) -> None:
         """Push files added/changed since the last push and delete removed ones, in one commit."""

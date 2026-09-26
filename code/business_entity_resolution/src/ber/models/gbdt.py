@@ -141,6 +141,16 @@ class GBDT:
             self.device = "cpu"
             return self.model.predict(d, iteration_range=rng).astype(np.float32)
 
+    def on_device(self, device: str) -> "GBDT":
+        """A copy that predicts on ``device`` (e.g. ``cuda:1``), for scoring shards on several GPUs at once."""
+        obj = GBDT.__new__(GBDT)
+        obj.__dict__.update(self.__dict__)
+        if self.backend == "xgboost":
+            obj.model = self.model.copy()
+            obj.model.set_param({"device": device})
+            obj.device, obj._pred_ready = device, True
+        return obj
+
     def importance(self) -> dict:
         if self.backend == "lightgbm":
             return dict(zip(self.features, self.model.feature_importance("gain").tolist()))
