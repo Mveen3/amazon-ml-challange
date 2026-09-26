@@ -12,6 +12,43 @@ raw TSV ─► 0 normalise ─► 1 candidates (TF-IDF/RP kNN + keys ─► pre-
 
 ---
 
+## 0. Final submission: how to reproduce it (read this first)
+
+The final submission is produced by **`configs/final.yaml`**: the Kaggle profile (2× T4, 4 CPU, 30 GB RAM; a
+larger machine works unchanged) plus the final improvements, which are listed at the top of that file. The
+methodology write-up is `docs/Documentation_template.md`.
+
+**From scratch (train + predict), from this folder, with the challenge data in `../../dataset/{train,test}`:**
+```bash
+pip install -r requirements.txt            # or requirements-kaggle.txt on a Kaggle image
+python -m ber.pipeline.run --config configs/final.yaml --stage all
+```
+- It writes `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv` and runs the official
+  validator on them.
+- Runtime on Kaggle 2× T4 is about 11 h. Every stage resumes after an interruption (see §4.3.1).
+
+**Inference only on new test data, with our trained models:**
+```bash
+mkdir -p work && tar xzf <team>_models.tar.gz -C work     # tables.pkl + models/ (incl. density_ref.json)
+python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all
+```
+This processes only `../../dataset/test/` and loads every model, calibrator, floor and threshold. Verified on
+sample data: it reproduces the full run's outputs byte for byte.
+
+**How the final files were computed on Kaggle (checkpointed tracks; same result as one from-scratch run):**
+1. `full` = `configs/kaggle.yaml`: the full pipeline run.
+2. `configs/track_a.yaml`: r1/r2 re-trained on 800k entities (starts from `r1`).
+3. `configs/track_g.yaml`: final round 2 with competing-cluster features and per-country list sizes (starts from
+   `r2`).
+4. `configs/track_f.yaml`: inference-only, test features recomputed with the France adaptations and re-scored with
+   the trained models (starts from `features`). Its outputs and models bundle are the final submission.
+
+On sample data this chain gives a `matching_results.tsv` / `candidate_pairs.tsv` byte-identical to one
+from-scratch `final.yaml` run. On the full data the one difference is that the chain reuses the cross-encoder
+scores of the first run (their score band came from the 500k-entity round 1).
+
+---
+
 ## 1. Layout
 
 ```
@@ -309,10 +346,12 @@ $R --stage predict,outputs --probe fr_loose  --set decision.overrides.france.del
 - **No external data:**
   - Lookup tables are mined from training pairs only, and each entry must be supported by ≥ 20 distinct S1 entities.
   - Hand-written rules are abbreviation knowledge only (street types, legal forms).
+  - For a country without training labels (France), the address administrative level is detected from that split's own addresses (`features/admin.py`), not from a gazetteer.
   - No gazetteers, geocoders or APIs are used.
 - **Model licences and size:**
   - LightGBM / XGBoost: trees only.
   - `BAAI/bge-reranker-v2-m3`: Apache-2.0, 568M parameters.
+  - `intfloat/multilingual-e5-small` (the cross-encoder of `kaggle.yaml` / `final.yaml`, i.e. the final submission): MIT, 118M parameters.
   - Optional `intfloat/multilingual-e5-base`: MIT, 278M parameters.
   - Total stays well under 8B parameters.
 
