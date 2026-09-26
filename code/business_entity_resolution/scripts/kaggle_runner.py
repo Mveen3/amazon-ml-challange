@@ -58,7 +58,7 @@ class KaggleRun:
                  use_cross_encoder=True, use_hf_checkpoint=True, fresh_start=False, overrides=(),
                  working="/kaggle/working", input_root="/kaggle/input", scratch=None):
         self.pkg = Path(pkg)
-        self.config = config
+        self.config = self._resolve_config(config)
         self.slug = dataset_slug
         self.team = re.sub(r"[^A-Za-z0-9_-]+", "_", str(team).strip()).strip("_") or "team"
         self.use_ce = bool(use_cross_encoder)
@@ -89,6 +89,18 @@ class KaggleRun:
               f"HF checkpoints: {self.use_ckpt} | fresh start: {self.fresh_pending}")
 
     # ------------------------------------------------------------------ helpers
+    def _resolve_config(self, config: str) -> str:
+        """``configs/track_g.yaml``, ``track_g.yaml``, ``track_g`` and ``configs/configs/track_g.yaml`` all work; a
+        missing config fails here, before any GPU time is spent."""
+        cands = [str(config), f"configs/{Path(str(config)).name}", f"configs/{Path(str(config)).stem}.yaml"]
+        for c in cands:
+            if (self.pkg / c).is_file():
+                if c != str(config):
+                    print(f"CONFIG {config!r} -> using {c!r}")
+                return c
+        known = ", ".join(sorted(p.name for p in (self.pkg / "configs").glob("*.yaml")))
+        raise FileNotFoundError(f"CONFIG {config!r} not found in {self.pkg / 'configs'} (available: {known})")
+
     @staticmethod
     def sh(cmd: str, check: bool = True):
         print(f"$ {cmd}")
@@ -156,9 +168,23 @@ class KaggleRun:
             print("HF_TOKEN loaded (value hidden) -> every finished stage is checkpointed to a private HF repo.")
             return True
         self.use_ckpt = False
+        if self._is_track():  # a track needs its base run's checkpoint: stop before any GPU time is spent
+            raise RuntimeError(
+                f"No HF_TOKEN secret available ({type(err).__name__ if err else 'empty'}), but {self.config} is a "
+                "track that starts from a checkpoint on Hugging Face. Open the notebook in the Kaggle editor, "
+                "Add-ons -> Secrets -> tick HF_TOKEN, then start it with 'Save Version' (Kaggle Secrets are only "
+                "available to runs started from the web editor).")
         print(f"No HF_TOKEN secret available ({type(err).__name__ if err else 'empty'}): the run works, but without "
               "checkpoints. Add-ons -> Secrets -> add HF_TOKEN and tick it for this notebook to enable them.")
         return False
+
+    def _is_track(self) -> bool:
+        try:
+            from ber.config import load_config
+
+            return bool(load_config(self.pkg / self.config, self.overrides).checkpoint.get("restore_from"))
+        except Exception:  # noqa: BLE001
+            return False
 
     def data(self) -> None:
         if str(self.pkg / "scripts") not in sys.path:

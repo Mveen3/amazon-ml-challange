@@ -111,17 +111,17 @@ def _competition(df: pl.DataFrame, cfg, split: str) -> pl.DataFrame:
     src = pl.read_parquet(work_dir(cfg, split, "records.parquet"), columns=["uid", "src"]).rename({"uid": "rec_uid"})
     d = df.select(["s1_uid", "rec_uid", "p1", "c1_s1_rank"]).join(src, on="rec_uid", how="left")
     d = d.with_columns(((pl.col("p1") >= tau) & (pl.col("c1_s1_rank") <= int(rc.top_members))).alias("_mem"))
-    cnt = d.filter("_mem").group_by("s1_uid").agg([pl.len().alias("_n"), (pl.col("src") == 2).sum().alias("_n2"),
+    cnt = d.filter(pl.col("_mem")).group_by("s1_uid").agg([pl.len().alias("_n"), (pl.col("src") == 2).sum().alias("_n2"),
                                                    (pl.col("src") == 3).sum().alias("_n3")])
     cap_of = pl.when(pl.col("src") == 2).then(caps.get(2, 99)).otherwise(caps.get(3, 99))
     # the record's two best S1s -> competitor of each pair
     top = (d.sort(["rec_uid", "p1", "s1_uid"], descending=[False, True, False]).group_by("rec_uid", maintain_order=True)
-           .agg([pl.col("s1_uid").first().alias("_t1"), pl.col("s1_uid").get(1, null_on_oob=True).alias("_t2"),
+           .agg([pl.col("s1_uid").first().alias("_t1"), pl.col("s1_uid").slice(1, 1).first().alias("_t2"),
                  pl.col("p1").max().alias("_pmax"), pl.len().alias("_nr")]))
     d = d.join(top, on="rec_uid", how="left").with_columns(
         pl.when(pl.col("s1_uid") == pl.col("_t1")).then(pl.col("_t2")).otherwise(pl.col("_t1")).alias("_comp"))
     close_n = d.group_by("rec_uid").agg((pl.col("p1") >= pl.col("_pmax") - close).sum().alias("cm_n_close"))
-    comp_mem = d.filter("_mem").select([pl.col("s1_uid").alias("_comp"), "rec_uid", pl.lit(True).alias("_cmem")])
+    comp_mem = d.filter(pl.col("_mem")).select([pl.col("s1_uid").alias("_comp"), "rec_uid", pl.lit(True).alias("_cmem")])
     d = (d.join(cnt, on="s1_uid", how="left")
          .join(cnt.rename({"s1_uid": "_comp", "_n": "_cn", "_n2": "_cn2", "_n3": "_cn3"}), on="_comp", how="left")
          .join(comp_mem, on=["_comp", "rec_uid"], how="left").join(close_n, on="rec_uid", how="left")
