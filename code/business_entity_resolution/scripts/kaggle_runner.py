@@ -294,7 +294,9 @@ class KaggleRun:
         shutil.rmtree(sd, ignore_errors=True)  # stale stage markers would silently skip stages
         self.sh(f"cd {q(self.pkg)} && {q(sys.executable)} scripts/make_sample.py --data {q(self.data_dir)} "
                 f"--out {q(sd / 'sample_data')}")
-        sets = self._sets(f"{sd}/sample_data", f"{sd}/work", f"{sd}/output") + SMOKE_SETS
+        # own rehearsal folder per config: two accounts rehearsing at the same time must not delete each other's
+        own = [f"checkpoint.prefix=smoke-{Path(self.config).stem}"]
+        sets = self._sets(f"{sd}/sample_data", f"{sd}/work", f"{sd}/output") + SMOKE_SETS + own
         log_file = self.logs / "smoke.log"
         start = log_file.stat().st_size if log_file.exists() else 0
         self.run("all", sets, log_name="smoke.log", fresh=True)
@@ -305,7 +307,7 @@ class KaggleRun:
             print("SMOKE TEST PASSED (no checkpoint round-trip: HF checkpoints are off).")
             return
         print("\n--- checkpoint round-trip: new empty work dir, same checkpoint -> restore and skip every stage ---")
-        sets2 = self._sets(f"{sd}/sample_data", f"{sd}/work_restored", f"{sd}/output_restored") + SMOKE_SETS
+        sets2 = self._sets(f"{sd}/sample_data", f"{sd}/work_restored", f"{sd}/output_restored") + SMOKE_SETS + own
         self.run("all", sets2, log_name="smoke.log")
         same = all((sd / "output" / f).read_bytes() == (sd / "output_restored" / f).read_bytes()
                    for f in ("matching_results.tsv", "candidate_pairs.tsv"))
