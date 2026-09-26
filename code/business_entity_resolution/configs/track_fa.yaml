@@ -1,0 +1,25 @@
+# Track FA (improvement.md): France fix on top of Track A's models. Kaggle GPU session (T4 x2), about 2 h.
+# Can run IN PARALLEL with Track G (it only needs the finished folders 'full' and 'track_a').
+# Inference only, test split only: recomputes the test pair features with the France adaptations (address admin
+# level ignored, list-size counts on the train scale; features/admin.py) and re-scores the test set with Track A's
+# trained models. India / US predictions stay identical to Track A, so (leaderboard FA) - (leaderboard Track A)
+# is the France effect. Track A's round 2 and gate were trained on raw list-size counts, so the per-country
+# normalisation of those counts is switched off here to match them. Progress goes to the folder 'track_fa'.
+inherit: final.yaml
+
+run:
+  inference_only: true
+
+r2:
+  density_norm: false              # Track A's r2 models were trained on raw c1 list sizes
+gate:
+  density_norm: false              # Track A's gate was trained on raw g_ncand / g_n_owned
+
+checkpoint:
+  prefix: track_fa
+  restore_from: [full, track_a]
+  start_from: features
+  keep_stages: [ce_train, ce_infer]
+  # the trained models (+ Track A's out-of-fold report, which describes exactly these models)
+  restore_keep: ["models/r1/*", "models/r2/*", "models/gate/*", "models/thresholds.json", "models/oof_report*.json"]
+  restore_ignore: ["*/cands/union/*", "*/cands/pre_all.*", "*/cands/pre_parts/*", "train/feats/*", "train/preds/*"]
