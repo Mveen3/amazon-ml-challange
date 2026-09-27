@@ -405,7 +405,7 @@ class KaggleRun:
     # ------------------------------------------------------------------ next track in the same session
     # the stage groups of the notebook's full-run cells
     FULL_RUN = ["ingest,eda,mine,normalize", "block", "prerank,expand", "features", "r1", "ce_train,ce_infer",
-                "r2,r2bag,r3,gate,tune,predict,outputs"]
+                "r2,r2bag,r3,r3bag,gate,tune,predict,outputs"]
 
     def full_run(self) -> None:
         for stages in self.FULL_RUN:

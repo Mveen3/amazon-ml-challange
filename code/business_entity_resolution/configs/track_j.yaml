@@ -1,0 +1,19 @@
+# Track J (Kaggle, branch kaggle-run): round-3 bagging on top of Track I. Restores full + track_a + track_g + track_h +
+# track_i (read only) and re-does r3bag (2 more round-3 models on other 700k-entity samples, averaged with Track I's)
+# -> gate -> tune -> predict -> outputs -> errors. France keeps its logit shift.
+inherit: config.yaml
+
+run:
+  extra_stages: [errors]
+
+r3:
+  enabled: true
+  bags: 3
+
+checkpoint:
+  enabled: true
+  prefix: track_j
+  restore_from: [full, track_a, track_g, track_h, track_i]
+  start_from: r3bag
+  keep_stages: [ce_train, ce_infer]
+  restore_ignore: ["*/cands/union/*", "*/vec/*", "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*"]
