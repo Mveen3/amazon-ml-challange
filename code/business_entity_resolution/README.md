@@ -1,7 +1,7 @@
 # Business Entity Resolution — Amazon ML Challenge 2026 (team neural_nexus)
 
 This pipeline links noisy Source 2 / Source 3 business records to Source 1 entities, optimised for per-entity
-**macro F0.5**. Final submission: **public leaderboard 0.985252**, train out-of-fold macro F0.5 0.98962.
+**macro F0.5**. Final submission: **public leaderboard 0.985374**, train out-of-fold macro F0.5 0.98962.
 The methodology is described in `Documentation_template.md` at the top level of the submission zip.
 
 ```
@@ -188,6 +188,8 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 | `features.admin_strip` | on, `pairs: false` | address admin level of countries without labels, ignored in round-2 consensus only |
 | `decision.grid`, `decision.expected` | | search space of the per-country set rules |
 | `decision.overrides.france` | κ 1.2 | France's set rule (no labels; see the documentation) |
+| `decision.logit_shift` | France 0.5 | test-time density correction of France's probabilities (France lists are 2× denser than train) |
+| `r3.enabled` | false | optional round 3 (round-2 features rebuilt from round-2 scores); not in the final submission |
 | `*.gbdt` | XGBoost, 4 folds | backend (`xgboost` / `lightgbm`), device (`auto` / `cpu` / `cuda`), rounds, parameters |
 | `run.max_gpus` | 0 | 0 = use all GPUs; 1 = single-GPU behaviour everywhere |
 | `run.n_workers` | -1 | CPU workers (-1 = all cores) |
@@ -234,7 +236,8 @@ chain into one from-scratch run.
 | A | round 1 re-trained on 800k entities | 0.98952 | — |
 | G | round 2 with competing-cluster features, 700k entities | 0.98959 | 0.985166 |
 | F | France admin level also ignored in round-1 features, France list sizes rescaled | same as G | 0.985031 (rejected) |
-| **H** | **round-2 bagging (3 samples), on top of G** | **0.98962** | **0.985252 (final)** |
+| H | round-2 bagging (3 samples), on top of G | 0.98962 | 0.985252 |
+| **H + France shift** | **France test probabilities shifted by 0.5 logits (`decision.logit_shift`)** | **0.98962** | **0.985374 (final)** |
 
 On sample data, this chain and one from-scratch run of the same settings give byte-identical outputs. On the full
 data, the one difference is that the chain reused the cross-encoder scores of the full run, whose score band came
