@@ -43,6 +43,10 @@ sample data: it reproduces the full run's outputs byte for byte.
 4. `configs/track_f.yaml`: inference-only, test features recomputed with the France adaptations and re-scored with
    the trained models (starts from `features`). Its outputs and models bundle are the final submission.
 
+5. `configs/track_h.yaml`: round-2 bagging, i.e. two more round-2 models on other 700k-entity samples averaged with
+   Track G's (starts from `r2bag`). France keeps Track G's features and set rule: Track F's France adaptations cost
+   0.000135 on the leaderboard (0.985031 vs Track G's 0.985166, India/US identical).
+
 Tracks 3 and 4 run in one Kaggle session: notebook `CONFIG = "configs/track_g.yaml"`,
 `THEN_CONFIG = "configs/track_f.yaml"`. Track G's files end up in `/kaggle/working/track_g/`, Track F's at the top
 level.

@@ -45,6 +45,8 @@ STAGE_FILES = {
     "ce_train": ["models/ce/*"],
     "ce_infer": ["*/preds/ce_*"],
     "r2": ["models/r2/*", "*/feats/r2_extras.parquet", "*/preds/r2.parquet"],
+    # r2bag rewrites */preds/r2.parquet too (averaged scores, round-2 model's own kept as p2_b0); it stays r2's file
+    "r2bag": ["models/r2_bag*", "*/preds/r2_bag*"],
     "gate": ["models/gate/*", "*/preds/gate.parquet"],
     "tune": ["models/thresholds.json", "models/stress_check.json", "models/decision/*"],
     "predict": ["*/preds/selected*", "models/oof_report*.json"],

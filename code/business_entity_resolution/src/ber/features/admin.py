@@ -107,7 +107,7 @@ def build_admin_vocab(cfg, split: str) -> dict[str, list[str]]:
         vocab = sorted(c for c in s1_level | rec_level if c)
         if vocab:
             out[country] = vocab
-            log().info("  %s/%s (no training labels): address admin level ignored in pair features: %s", split,
+            log().info("  %s/%s (no training labels): address admin level detected: %s", split,
                        country, ", ".join(vocab[:12]) + (" ..." if len(vocab) > 12 else ""))
     save_json(out, _path(cfg, split))
     return out

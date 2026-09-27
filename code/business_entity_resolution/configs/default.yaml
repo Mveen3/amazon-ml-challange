@@ -108,6 +108,7 @@ features:
   density_match: true            # profiles WITHOUT labels (France): r1 list-size counts put on the train scale
   admin_strip:                   # address admin level ignored for profiles WITHOUT training labels (France)
     enabled: true
+    pairs: true                  # also in the round-1 pair features (false: round-2 consensus only)
     s1_last_share: 0.02          # components ending >= 2% of the country's S1 addresses (regions / states)
     rec_share: 0.005             # record components in >= 0.5% of S2/S3 addresses ...
     max_s1_ratio: 0.05           # ... that are (almost) absent from S1 addresses (departments / counties)
@@ -151,6 +152,7 @@ r2:
   density_norm: true             # c1 list-size counts divided by the country median (France lists are 2x longer)
   top_members: 8
   chunk_s1: 200000
+  bags: 1                        # >1: extra round-2 models on other entity samples, averaged (stage r2bag)
 
 gate:
   density_norm: true             # g_ncand / g_n_owned divided by the country median

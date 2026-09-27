@@ -8,6 +8,9 @@ inherit: final.yaml
 run:
   extra_stages: [errors]
 
+r2:
+  bags: 1                          # ran before bagging existed
+
 checkpoint:
   prefix: track_g
   restore_from: [full, track_a]

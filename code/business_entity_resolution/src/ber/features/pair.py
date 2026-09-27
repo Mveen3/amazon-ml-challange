@@ -310,9 +310,12 @@ def run_features(cfg, split: str) -> None:
     from ..checkpoint import sync_now
 
     build_token_idf(cfg, split)
-    admin = build_admin_vocab(cfg, split)  # {} unless a country has no training labels (e.g. France)
-    unlabelled, ref = unlabelled_countries(cfg, split), density_ref(cfg)
     fc = cfg.features
+    admin = build_admin_vocab(cfg, split)  # {} unless a country has no training labels (e.g. France)
+    if not (fc.get("admin_strip") or {}).get("pairs", True):
+        admin = {}  # admin level kept in the round-1 pair features (round 2's consensus reads the vocabulary itself)
+    unlabelled = unlabelled_countries(cfg, split)
+    ref = density_ref(cfg) if fc.get("density_match", True) else None
     in_dir, out_dir = work_dir(cfg, split, "feats", "r1_in"), work_dir(cfg, split, "feats", "r1")
     final = work_dir(cfg, split, "cands", "final.parquet")
     plan = {"join_rows": int(fc.get("join_rows", 4_000_000)), "shard_rows": int(fc.get("shard_rows", 500_000)),

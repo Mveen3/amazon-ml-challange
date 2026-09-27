@@ -9,6 +9,13 @@ inherit: final.yaml
 run:
   inference_only: true
 
+features:                          # the France adaptations this track tested
+  density_match: true
+  admin_strip: {pairs: true}
+
+r2:
+  bags: 1
+
 checkpoint:
   prefix: track_f
   restore_from: [full, track_a, track_g]

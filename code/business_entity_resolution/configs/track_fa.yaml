@@ -10,10 +10,18 @@ inherit: final.yaml
 run:
   inference_only: true
 
+features:                          # the France adaptations this track tested
+  density_match: true
+  admin_strip: {pairs: true}
+
 r2:
+  bags: 1
   density_norm: false              # Track A's r2 models were trained on raw c1 list sizes
 gate:
   density_norm: false              # Track A's gate was trained on raw g_ncand / g_n_owned
+decision:
+  overrides:
+    france: {kappa: 0.8}           # Track A's US thresholds, which France inherited in this track
 
 checkpoint:
   prefix: track_fa

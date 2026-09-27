@@ -1,0 +1,18 @@
+# Track H: round-2 bagging on top of Track G. Kaggle GPU session (T4 x2), about 2 h.
+# Starts from the finished runs 'full' + 'track_a' + 'track_g' (read only). Track G's round-2 model is bag 0; two
+# more round-2 models are trained on other 700k-entity samples and the three are averaged (stage r2bag), then the
+# gate, thresholds, predictions and outputs are re-done on the averaged scores. The train out-of-fold report is
+# directly comparable with Track G's 0.98959. France: Track G's features and set rule (final.yaml), so only the
+# averaged probabilities change there. Progress goes to the folder 'track_h'. Its outputs and models bundle (with the
+# cross-encoder, restored from 'full') form a complete final package.
+inherit: final.yaml
+
+run:
+  extra_stages: [errors]
+
+checkpoint:
+  prefix: track_h
+  restore_from: [full, track_a, track_g]
+  start_from: r2bag
+  keep_stages: [ce_train, ce_infer]
+  restore_ignore: ["*/cands/union/*", "*/vec/*", "*/cands/pre_all.*", "*/cands/pre.parquet", "*/cands/pre_parts/*"]
