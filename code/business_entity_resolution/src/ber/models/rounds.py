@@ -57,6 +57,7 @@ def r2_extras(cfg, split: str) -> pl.DataFrame:
 
 
 R2_OUT = KEYS + ["fold", "prof", "label", "src", "nm_tset", "ad_tset", "num_hit"]
+R3_EXTRA = ["p1_r1"]  # round 3: the round-2 extras rebuilt from round-2 scores, plus the round-1 score
 
 
 def _join_extras(extras: pl.DataFrame):
@@ -88,21 +89,23 @@ def run_r2(cfg) -> None:
         work_dir(cfg, "test", "preds", "r2.parquet"))
 
 
-def _fit_r2(cfg, mdir, seed: int, tag: str = "r2") -> pl.DataFrame:
-    """One round-2 fold set in ``mdir``, trained on the entity sample drawn with ``seed``; returns its train OOF
-    scores (R2_OUT + ``pred``)."""
-    extras = pl.read_parquet(work_dir(cfg, "train", "feats", "r2_extras.parquet"))
+def _fit_r2(cfg, mdir, seed: int, tag: str = "r2", stage: str = "r2") -> pl.DataFrame:
+    """One round-2 (or round-3) fold set in ``mdir``, trained on the entity sample drawn with ``seed``; returns its
+    train OOF scores (R2_OUT + ``pred``)."""
+    sc = cfg[stage]
+    extras = pl.read_parquet(work_dir(cfg, "train", "feats", f"{stage}_extras.parquet"))
     paths = r1_paths(cfg, "train")
     avail = columns_of(paths)
-    feats = [f for f in R1_FEATURES + R2_EXTRA if f in avail or f in extras.columns]
-    sample = training_sample(paths, entities(paths), int(cfg.r2.sample_entities),
-                             int(cfg.r2.get("max_train_rows", 8_000_000)), seed, tag)
+    feats = [f for f in R1_FEATURES + R2_EXTRA + (R3_EXTRA if stage == "r3" else [])
+             if f in avail or f in extras.columns]
+    sample = training_sample(paths, entities(paths), int(sc.sample_entities),
+                             int(sc.get("max_train_rows", 8_000_000)), seed, tag)
     tr = load_rows(paths, KEYS + ["fold", "label"] + feats, sample)
     tr = tr.join(extras.filter(pl.col("s1_uid").is_in(sample.implode())), on=KEYS, how="inner").sort(KEYS)
     X, y, fold, ents = to_matrix(tr, feats), tr["label"].to_numpy().astype(np.float32), tr["fold"].to_numpy(), tr["s1_uid"].to_numpy()
     del tr  # free the polars table before (possibly concurrent) fold training
-    models = fit_folds(X, y, fold, ents, cfg.r2.gbdt, feats, mdir, seed=seed,
-                       threads=n_workers(cfg), monotone=cfg.r2.get("monotone", []))
+    models = fit_folds(X, y, fold, ents, sc.gbdt, feats, mdir, seed=seed,
+                       threads=n_workers(cfg), monotone=sc.get("monotone", []))
     del X
     pr = score_r2(cfg, "train", extras, models)
     save_json(_auc(pr["label"].to_numpy().astype(np.float32), pr["pred"].to_numpy(), tag), mdir / "oof_metrics.json")
@@ -168,3 +171,58 @@ def run_r2bag(cfg) -> None:
                       work_dir(cfg, None, "models", "r2_bag_metrics.json"))
         r2.with_columns(pl.Series("q", Calibrator.load(cal_path).transform(p, prof))).write_parquet(path)
         log().info("  %s: round-2 scores = mean of %d models", split, n)
+
+
+def r3_extras(cfg, split: str) -> pl.DataFrame:
+    """Round-3 features: the round-2 extras (score context, consensus with confident members, competing clusters)
+    rebuilt from the round-2 scores instead of the round-1 scores, plus the round-1 score (``p1_r1``)."""
+    r2 = pl.read_parquet(work_dir(cfg, split, "preds", "r2.parquet"))
+    col = "p2_r2" if "p2_r2" in r2.columns else "p2"   # after round 3, r2.parquet keeps round 2's score as p2_r2
+    p = r2.select(KEYS + [pl.col(col).alias("p1")]).join(load_r1(cfg, split, columns=KEYS + ["num_hit"]), on=KEYS,
+                                                           how="left")
+    ce = load_ce(cfg, split) if cfg.ce.enabled else None
+    ex = build_r2_extras(cfg, split, p, ce)
+    p1 = pl.read_parquet(work_dir(cfg, split, "preds", "r1.parquet"), columns=KEYS + ["p1"]).rename({"p1": "p1_r1"})
+    return ex.join(p1, on=KEYS, how="left").sort(KEYS)
+
+
+def run_r3(cfg) -> None:
+    """Round 3 (collective stacking): a pair model on the round-2 features recomputed from the round-2 scores, so
+    each record's cluster context (confident members, competing S1s) comes from the stronger model. Its calibrated
+    scores replace round 2's in ``preds/r2.parquet`` (round 2's kept as ``p2_r2`` / ``q_r2``), so the gate, the
+    thresholds and the outputs run on them unchanged. Off unless ``r3.enabled``."""
+    rc = cfg.get("r3") or {}
+    if not rc.get("enabled", False):
+        log().info("  r3.enabled = false: no round 3")
+        return
+    from ..checkpoint import sync_now
+
+    mdir = ensure_dir(work_dir(cfg, None, "models", "r3"))
+    splits = ("test",) if inference_only(cfg) else ("train", "test")
+    for split in splits:
+        r3_extras(cfg, split).write_parquet(ensure_dir(work_dir(cfg, split, "feats")) / "r3_extras.parquet")
+    if not inference_only(cfg) and not (mdir / "calibrator.pkl").exists():
+        pr = _fit_r2(cfg, mdir, int(cfg.run.seed) + 300, tag="r3", stage="r3")
+        y, oof, prof = pr["label"].to_numpy().astype(np.float32), pr["pred"].to_numpy(), pr["prof"].to_numpy()
+        Calibrator(fallback=cfg.decision.fallback_profile).fit(oof, y, prof).save(mdir / "calibrator.pkl")
+        pr.select(KEYS + [pl.col("pred").alias("p3")]).write_parquet(work_dir(cfg, "train", "preds", "r3_train.parquet"))
+        sync_now("round 3 trained")
+    extras = pl.read_parquet(work_dir(cfg, "test", "feats", "r3_extras.parquet"))
+    score_r2(cfg, "test", extras, load_folds(mdir)).select(KEYS + [pl.col("pred").alias("p3")]).write_parquet(
+        work_dir(cfg, "test", "preds", "r3_test.parquet"))
+    cal = Calibrator.load(mdir / "calibrator.pkl")
+    for split in splits:
+        path = work_dir(cfg, split, "preds", "r2.parquet")
+        r2 = pl.read_parquet(path)
+        if "p2_r2" not in r2.columns:
+            r2 = r2.with_columns(pl.col("p2").alias("p2_r2"), pl.col("q").alias("q_r2"))
+        p3 = pl.read_parquet(work_dir(cfg, split, "preds", f"r3_{split}.parquet"))
+        r2 = r2.drop(["p2", "q"]).join(p3, on=KEYS, how="left").rename({"p3": "p2"}).sort(KEYS)
+        p = r2["p2"].to_numpy()
+        r2 = r2.with_columns(pl.Series("q", cal.transform(p, r2["prof"].to_numpy())))
+        if split == "train":
+            y = r2["label"].to_numpy().astype(np.float32)
+            save_json({"r2": _auc(y, r2["p2_r2"].to_numpy(), "r2"), "r3": _auc(y, p, "r3")},
+                      work_dir(cfg, None, "models", "r3_metrics.json"))
+        r2.write_parquet(path)
+        log().info("  %s: pair scores = round 3", split)

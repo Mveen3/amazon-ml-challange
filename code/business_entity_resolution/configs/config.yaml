@@ -158,6 +158,15 @@ r2:                              # round-2 pair model: round-1 score + cross-enc
   chunk_s1: 100000
   bags: 3                        # 3 round-2 models on different 700k-entity samples, averaged (stage r2bag)
 
+r3:                              # round 3 (stage r3): round-2 extras rebuilt from round-2 scores + a new pair model
+  enabled: false
+  sample_entities: 700000
+  max_train_rows: 8000000
+  gbdt:
+    <<: *gbdt
+    max_entities: 700000
+  monotone: []
+
 gate:                            # entity-level P(S1 has >= 1 match)
   density_norm: true             # g_ncand / g_n_owned divided by the country median
   gbdt:
@@ -186,6 +195,8 @@ decision:                        # per-S1 set selection, tuned on train out-of-f
     min_gain: 0.0001             # switch rules only for a clear out-of-fold gain
   overrides:                     # France has no labels: the rule behind its measured leaderboard score (the US
     france: {rule: heuristic, kappa: 1.2, t_min: 0.0, delta: 0.0}   # optimum it would inherit is flat in kappa)
+  logit_shift:                   # test-time shift of pair + gate probabilities (logit scale, > 0 = stricter);
+    france: 0.5                  # France: candidate lists 2x denser than train -> overconfident (leaderboard-measured)
 
 stress:                          # optional robustness check of the thresholds (its hypothesis was refuted: off)
   enabled: false

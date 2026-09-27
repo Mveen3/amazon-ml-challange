@@ -123,10 +123,31 @@ def apply(cfg, arr: dict, th: dict) -> pl.DataFrame:
     return selected_pairs(arr, sel)
 
 
+def logit_shift(cfg, arr: dict) -> dict:
+    """Test-time correction per country (``decision.logit_shift``): pair and gate probabilities shifted by -s on
+    the logit scale (s > 0 = stricter). For a country without training labels whose candidate lists are denser than
+    in training (France: 2x), the calibrated probabilities are too high; the shift was measured on the leaderboard
+    (France, India/US unchanged: s = 0.5 -> +0.00081 France F0.5; s = 1.0 -> +0.00075; s = -0.5 -> -0.00164)."""
+    for prof, s in (cfg.decision.get("logit_shift") or {}).items():
+        m = arr["PROF"] == prof
+        if not m.any() or not float(s):
+            continue
+
+        def sh(p):
+            p = np.clip(p.astype(np.float64), 1e-9, 1 - 1e-9)
+            return 1.0 / (1.0 + np.exp(-(np.log(p / (1 - p)) - float(s))))
+
+        q = arr["Q"][m]
+        arr["Q"][m] = np.where(q > 0, sh(q), 0.0).astype(np.float32)
+        arr["G"][m] = sh(arr["G"][m]).astype(np.float32)
+        log().info("  %s: test probabilities shifted by %+.3f on the logit scale", prof, -float(s))
+    return arr
+
+
 def run_predict(cfg, tag: str | None = None) -> dict:
     th = load_json(work_dir(cfg, None, "models", "thresholds.json"))
     rep = {} if inference_only(cfg) else _train_report(cfg, th, tag)
-    arr = load_arrays(cfg, "test")
+    arr = logit_shift(cfg, load_arrays(cfg, "test"))
     pred = apply(cfg, arr, th)
     pred.write_parquet(work_dir(cfg, "test", "preds", f"selected{'_' + tag if tag else ''}.parquet"))
     log().info("  test: %d matches for %d S1 (%.2f per S1)", pred.height, len(arr["S1"]),

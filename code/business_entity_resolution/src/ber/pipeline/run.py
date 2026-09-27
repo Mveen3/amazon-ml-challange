@@ -176,6 +176,9 @@ def run_stage(cfg, stage: str, args) -> dict | None:
     elif stage == "r2bag":
         from ..models.rounds import run_r2bag
         run_r2bag(cfg)
+    elif stage == "r3":
+        from ..models.rounds import run_r3
+        run_r3(cfg)
     elif stage == "gate":
         from ..models.gate import run_gate
         run_gate(cfg)
