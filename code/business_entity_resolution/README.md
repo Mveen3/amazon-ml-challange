@@ -1,440 +1,254 @@
-# Business Entity Resolution — Amazon ML Challenge 2026
+# Business Entity Resolution — Amazon ML Challenge 2026 (team neural_nexus)
 
-This pipeline links noisy Source 2 / Source 3 business records to clean Source 1 entities. It is optimised for per-entity **macro F0.5**.
-
-The design, the data facts and the reasoning behind every choice are in [`docs/Pipeline_Architecture.md`](../../docs/Pipeline_Architecture.md). This README explains **how to run it**.
+This pipeline links noisy Source 2 / Source 3 business records to Source 1 entities, optimised for per-entity
+**macro F0.5**. Final submission: **public leaderboard 0.985252**, train out-of-fold macro F0.5 0.98962.
+The methodology is described in `Documentation_template.md` at the top level of the submission zip.
 
 ```
-raw TSV ─► 0 normalise ─► 1 candidates (TF-IDF/RP kNN + keys ─► pre-ranker floor ─► 2-hop) ══► candidate_pairs.tsv
-        ─► 2 round-1 GBDT ─► cross-encoder (uncertain band) ─► round-2 GBDT ×3 bags (consensus + competition)
-        ─► 3 one owner per record ─► entity gate ─► first-member rule + t_add(k) + caps ══► matching_results.tsv
+raw TSV ─► normalise ─► candidates: TF-IDF/random-projection kNN (GPU) + exact keys ─► pre-ranker floor ══► candidate_pairs.tsv
+        ─► round-1 GBDT ─► cross-encoder (uncertain band) ─► round-2 GBDT × 3 bags (consensus + competing clusters)
+        ─► one owner per record ─► entity gate ─► per-S1 set rule tuned on out-of-fold F0.5 ══► matching_results.tsv
 ```
+
+All settings of the final submission are in one file, **`configs/config.yaml`**.
 
 ---
 
-## 0. Final submission: how to reproduce it (read this first)
+## 1. Reproduce the final submission
 
-The final submission (leaderboard 0.985252) is produced by **`configs/final.yaml`**. The methodology write-up is
-`Documentation_template.md` at the top of the submission zip.
+### 1.1 Machine (for example on AWS)
 
-### 0.1 Machine (for example on AWS)
+| | Requirement |
+|---|---|
+| GPU | 1 or more NVIDIA GPUs with ≥ 16 GB, driver supporting CUDA 12 (e.g. `g5.4xlarge`, `g6.4xlarge`, `g4dn.12xlarge`; AWS Deep Learning AMIs qualify). Every multi-GPU path detects the GPUs itself; one GPU works. |
+| RAM | ≥ 32 GiB, 64 GiB recommended (measured peak 30.3 GB, while training round 1 / round 2) |
+| CPU | ≥ 4 cores; normalisation and pair features scale with cores |
+| Disk | ~100 GB free for `work/` |
+| Network | Once, to download `intfloat/multilingual-e5-small` (MIT, 118M parameters) from Hugging Face. No token, credentials or other network access. |
+| Python | 3.12 |
 
-- **One GPU instance** is enough, for example `g5.4xlarge` / `g6.4xlarge` (1 GPU with 24 GB, 16 vCPU, 64 GiB) or
-  `g4dn.12xlarge` (4× T4, 48 vCPU, 192 GiB). Every multi-GPU path detects the GPUs itself; one GPU works.
-- **RAM:** at least 32 GiB, 64 GiB recommended (measured peak 30.3 GB, in round 1 / round 2 training).
-- **Disk:** about 100 GB free for `work/`.
-- **Internet:** once, to download `intfloat/multilingual-e5-small` (MIT, 118M parameters) from Hugging Face. No
-  token, AWS service or other network access is used.
-- **Runtime:** about 12 h on Kaggle's 4 CPU + 2× T4. A 16-vCPU instance is faster on the CPU-heavy stages.
+Without a GPU the pipeline still runs (kNN and XGBoost fall back to CPU), but blocking takes many hours; see §7.
 
-### 0.2 Commands
+### 1.2 Setup
 
-The zip's top level holds `output/`, `code/` and `Documentation_template.md`. Put the challenge data next to
-them, in `dataset/train/` and `dataset/test/`; the official validator, if present in `utils/validate_submission.py`,
-runs automatically at the end.
+The submission zip's top level holds `output/`, `code/` and `Documentation_template.md`. Put the challenge data
+next to them, and optionally the official validator:
+
+```
+.
+├── code/business_entity_resolution/   (this folder)
+├── dataset/train/{train_source1,train_source2,train_source3,train_ground_truth}.tsv
+├── dataset/test/{test_source1,test_source2,test_source3}.tsv
+├── utils/validate_submission.py       (optional: run automatically at the end)
+└── output/                            (written by the pipeline)
+```
 
 ```bash
-conda create -n ber python=3.12 -y && conda activate ber     # any Python 3.12 environment works
 cd code/business_entity_resolution
-pip install -r requirements.txt
-export PYTHONPATH=$PWD/src                                    # the package lives in src/ber (no install step)
-
-python -m ber.pipeline.run --config configs/final.yaml --stage all
+conda create -n ber python=3.12 -y && conda activate ber   # or any Python 3.12 environment (e.g. python3.12 -m venv)
+pip install -r requirements.txt                             # (conda alternative: conda env create -f environment.yml)
+export PYTHONPATH=$PWD/src                                  # the package is src/ber (no install step)
 ```
 
-- It writes `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv` (the zip's `output/`).
-- Every stage resumes after an interruption: run the same command again.
-- The run needs no credentials. Hugging Face checkpointing (`checkpoint.enabled`) is only for Kaggle sessions and
-  switches itself off without an `HF_TOKEN`.
-- **Quick check first (about 5 minutes):** see §3. `configs/smoke.yaml` runs every stage on a small sample, on CPU.
+### 1.3 Run
 
-**Inference only on new test data, with our trained models** (`neural_nexus_models.tar.gz`, 814 MB, available on
-request):
 ```bash
-mkdir -p work && tar xzf neural_nexus_models.tar.gz -C work   # tables.pkl + models/ (incl. density_ref.json)
-python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all
+python -m ber.pipeline.run --config configs/config.yaml --stage all
 ```
-This processes only `../../dataset/test/` and loads every model, calibrator, floor and threshold. Verified on
-sample data: it reproduces the full run's outputs byte for byte.
 
-### 0.3 How the final files were computed on Kaggle
+- Writes `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv`, then runs the official
+  validator (if present), then the error analysis.
+- **Resumable:** every stage writes a completion marker, and the long stages save finished pieces. After an
+  interruption, run the same command again; finished work is skipped.
+- A quick end-to-end check on a small sample takes a few minutes (§2); worth doing first.
 
-The submitted files come from checkpointed Kaggle runs ("tracks"). Each track restores the finished stages of the
-previous ones from Hugging Face and re-does the rest:
-1. `full` = `configs/kaggle.yaml`: the full pipeline run.
-2. `configs/track_a.yaml`: r1/r2 re-trained on 800k entities (starts from `r1`).
-3. `configs/track_g.yaml`: round 2 with competing-cluster features and per-country list sizes (starts from `r2`).
-   Leaderboard 0.985166.
-4. `configs/track_f.yaml`: France adaptations in the round-1 features (starts from `features`). Leaderboard
-   0.985031, i.e. −0.000135 against Track G with India/US identical: rejected.
-5. `configs/track_h.yaml`: round-2 bagging (starts from `r2bag`). Two more round-2 models on other 700k-entity
-   samples are averaged with Track G's. **Final submission, leaderboard 0.985252.**
+### 1.4 Outputs and reports
 
-`configs/final.yaml` holds all of these settings in one from-scratch run. On sample data the track chain and the
-from-scratch run give byte-identical outputs. On the full data the one difference is that the chain reuses the
-cross-encoder scores of the first run (their score band came from its 500k-entity round 1).
+- `../../output/matching_results.tsv`: the scored file.
+- `../../output/candidate_pairs.tsv`: the exact candidate set the matching models score (after the pre-ranker
+  floor). Every match is one of the candidates by construction.
+- `work/models/oof_report.json`: train out-of-fold macro F0.5 (by country, singleton / non-singleton), precision,
+  recall and the candidate ceiling (best macro F0.5 achievable from the candidates).
+- `work/models/error_analysis.md`: missed and wrong pairs by cause, loss by entity pattern.
+- `work/models/thresholds.json`, `work/models/r2_bag_metrics.json`, `work/models/*/oof_metrics.json`,
+  `work/models/*/importance.json`, `work/models/prerank/floor.json`, `work/models/prerank/expand.json`.
+
+### 1.5 Runtime
+
+Measured on Kaggle (4 CPU cores, 2× T4, 30 GB RAM), in minutes:
+
+| normalise etc. | block | prerank + expand | features | r1 | cross-encoder | r2 | r2bag | gate, tune, predict, outputs, errors |
+|---|---|---|---|---|---|---|---|---|
+| ~25 (estimate) | 157 | 60 | 176 | 74 | 117 | 37 | 55 | 26 |
+
+About 12 h in total. `features` and `normalize` are CPU-bound and shrink with more cores; `block` and the
+cross-encoder with a faster GPU.
 
 ---
 
-## 1. Layout
+## 2. Quick check on a sample (a few minutes)
+
+```bash
+bash scripts/smoke_test.sh          # CE=0 bash scripts/smoke_test.sh  skips the cross-encoder (no model download)
+```
+
+It builds `sample_data/` from the training data once (3k train S1 + 2k pseudo-test S1, where about 30% of the US
+clusters are relabelled "France" to exercise the path for a country without labels), runs every stage of
+`configs/config.yaml` with sample-size overrides into `work_smoke/` and `output_smoke/`, validates the outputs and
+scores them against the sample truth. Sample scores are far higher than real ones (sample distractors are random),
+so it proves the pipeline runs, not its accuracy.
+
+---
+
+## 3. Inference only, with the trained models
+
+The trained models (`neural_nexus_models.tar.gz`, 814 MB: mined tables, all GBDT fold models, the cross-encoder,
+calibrators, floors and thresholds) are available on request.
+
+```bash
+mkdir -p work && tar xzf neural_nexus_models.tar.gz -C work     # tables.pkl + models/
+python -m ber.pipeline.run --config configs/config.yaml --set run.inference_only=true --stage all
+```
+
+This processes `../../dataset/test/` only. Verified on sample data: it reproduces the full run's outputs byte for
+byte.
+
+---
+
+## 4. Stage by stage
+
+```bash
+R="python -m ber.pipeline.run --config configs/config.yaml"
+$R --stage ingest,eda,mine,normalize        # load TSVs, mine lookup tables from train pairs, parse every record
+$R --stage block                            # candidate union: kNN (GPU) + exact keys; logs the train union ceiling
+$R --stage prerank,expand                   # out-of-fold pre-ranker, floor tuned on the ceiling, 2-hop check
+$R --stage features                         # round-1 pair features (sharded, all cores)
+$R --stage r1                               # round-1 GBDT, out-of-fold on train
+$R --stage ce_train,ce_infer                # cross-encoder: two cross-fitted halves, uncertain band only
+$R --stage r2,r2bag                         # round 2 (+ 2 more bags on other entity samples, averaged)
+$R --stage gate,tune,predict,outputs        # entity gate, thresholds, submission files + validator
+$R --stage errors                           # train out-of-fold error analysis
+```
+
+- `--force` re-runs finished stages; `--from <stage>` runs from a stage onwards.
+- `--set key.sub=value` overrides any config value.
+- `--split train|test` runs a stage for one split; `ce_infer --shard i/n` splits cross-encoder scoring across
+  machines.
+- Moving between machines: copy `work/` (for example `aws s3 sync work/ s3://<bucket>/work/`).
+
+---
+
+## 5. Layout
 
 ```
 code/business_entity_resolution/
-├── README.md                    this file
-├── requirements.txt             pinned (pip)
-├── requirements-kaggle.txt      the few extra packages a Kaggle image needs
-├── environment.yml              pinned (conda env "ml")
-├── configs/
-│   ├── default.yaml             full-scale settings (every knob documented inline)
-│   ├── kaggle.yaml              Kaggle profile: 2x T4, 4 CPU cores, ~29 GB RAM, 12 h sessions
-│   └── smoke.yaml               tiny end-to-end test on sample_data/
-├── kaggle/
-│   └── amazon_ml_kaggle.ipynb   Kaggle notebook: imports data + code, trains, writes the submission
+├── README.md
+├── requirements.txt             pinned pip environment
+├── environment.yml              the same as a conda environment ("ber")
+├── configs/config.yaml          all settings of the final submission
 ├── scripts/
-│   ├── make_sample.py           build sample_data/ from the training set
-│   ├── score_sample.py          score smoke-test outputs against the hidden sample truth
-│   ├── kaggle_prepare.py        find/unpack the Kaggle dataset and link it into the expected layout
-│   └── package_submission.sh    build <team>_submission.zip (+ optional models bundle)
+│   ├── smoke_test.sh            quick end-to-end check on a sample
+│   ├── make_sample.py           builds sample_data/ from the training data
+│   ├── score_sample.py          scores sample outputs against the sample truth
+│   └── package_submission.sh    builds <team>_submission.zip (+ optional models bundle)
 └── src/ber/
-    ├── io.py                    TSV → Parquet, unified uid space, output writers
-    ├── normalize/               text cleanup, Indic romaniser + skeleton, country profiles, name/address parsers
-    ├── mining/tables.py         token / abbreviation / component / affix tables mined from train pairs
-    ├── blocking/                RP-TF-IDF vectors, GPU/CPU kNN, key blocking, union, pre-ranker, 2-hop
-    ├── features/                round-1 pair features, diff signatures, context, round-2 consensus
-    ├── models/                  GBDT wrapper + OOF, out-of-core streaming, calibration, cross-encoder,
-    │                            bi-encoder, rounds, gate
-    ├── decision/                vectorised set selection and threshold tuning
-    ├── eval/                    exact metric + ceiling, stress test, S1↔S1 diagnostic
-    ├── eda/profile.py           recomputes the data facts of the architecture doc (§2)
-    └── pipeline/                CLI (run.py) and output writing / validation
+    ├── io.py                    TSV → Parquet, unified id space, output writers
+    ├── normalize/               text cleanup, Indic romaniser, consonant skeletons, country profiles, parsers
+    ├── mining/tables.py         abbreviation / alias / component / affix tables mined from train pairs
+    ├── blocking/                TF-IDF random-projection vectors, GPU/CPU kNN, key blocks, union, pre-ranker, 2-hop
+    ├── features/                round-1 pair features, diff signatures, context, round-2 consensus and
+    │                            competing-cluster features, admin-level detection (admin.py)
+    ├── models/                  GBDT wrapper + out-of-fold training, streaming, calibration, cross-encoder, rounds, gate
+    ├── decision/                vectorised per-S1 set selection, exact expected-F0.5 rule, threshold tuning
+    ├── eval/                    exact metric and candidate ceiling, error analysis, diagnostics
+    ├── eda/profile.py           data profile (eda stage)
+    ├── checkpoint.py            optional Hugging Face mirror of work/ (off; used for resumable cloud sessions)
+    ├── progress.py              pipeline progress bar and time estimate
+    └── pipeline/                CLI (run.py), output writing and validation
 ```
 
-All intermediate artefacts go to `work/` (Parquet, `.npy` and model files). Each stage writes a completion marker, so the pipeline **resumes** where it stopped.
-
-**Memory model.** No stage holds the whole pair table in RAM:
-- Candidates are written per country.
-- The pre-ranker scores them in chunks.
-- Round-1 features live in shards of contiguous S1 ranges.
-- Each GBDT trains on the rows of a random sample of whole entities (`*.sample_entities`), then scores every pair shard by shard. Train rows are scored out-of-fold.
-
-Peak RAM therefore depends on the largest country partition and the training sample, not on the total number of pairs.
+**Memory model:** no stage holds the whole pair table in RAM. Candidates are written per country, the pre-ranker
+scores them in chunks, round-1 features live in shards of contiguous S1 ranges, and each GBDT trains on the rows of
+a sample of whole entities (`*.sample_entities`) and then scores every pair shard by shard (train rows
+out-of-fold). Peak RAM depends on the training sample, not on the total number of pairs.
 
 ---
 
-## 2. Environment
+## 6. Configuration (`configs/config.yaml`)
 
-```bash
-conda env create -f environment.yml        # creates the conda env "ml"
-conda activate ml
-cd code/business_entity_resolution
-export PYTHONPATH=$PWD/src
-```
-
-The CPU pipeline was verified end to end with the pinned versions. The neural stages (cross-encoder, optional bi-encoder) need a modern `transformers` (pinned: 4.46.3). An environment with `transformers` 2.x cannot load current Hugging Face models; either upgrade it or set `ce.enabled: false`.
-
----
-
-## 3. Smoke test (a few minutes on a laptop)
-
-```bash
-python scripts/make_sample.py --data ../../dataset --out sample_data     # 3k train S1 + 2k pseudo-test S1
-python -m ber.pipeline.run --config configs/smoke.yaml --stage all        # every stage, CPU only
-python scripts/score_sample.py                                            # macro F0.5 vs hidden sample truth
-```
-
-The pseudo-test split relabels about 30% of US clusters as "France", to exercise the path for a country with no training data. Its truth file is never read by the pipeline. Sample scores are much higher than real ones, because sample distractors are random rather than planted near-duplicates.
-
----
-
-## 4. Full run on Kaggle (2× T4)
-
-`kaggle/amazon_ml_kaggle.ipynb` holds only the settings and a `git clone`. Every other cell calls `scripts/kaggle_runner.py` from the cloned repository, so code fixes reach Kaggle with the next run and the notebook never needs re-importing. The notebook:
-1. clones this repository;
-2. installs the few missing packages;
-3. loads the Hugging Face token;
-4. imports the dataset;
-5. runs the pipeline with `configs/kaggle.yaml`, checkpointing every finished stage to a private Hugging Face repo;
-6. writes the submission files, the submission zip and a models bundle to `/kaggle/working`.
-
-### 4.1 One-time: upload the data as a Kaggle Dataset
-1. Zip your local `dataset/` folder (the one containing `train/` and `test/`) into `amazon-ml.zip`.
-2. On kaggle.com go to **Datasets → New Dataset**, drag in `amazon-ml.zip`, set the title to `amazon-ml`, keep it **Private**, and click **Create**.
-
-Any folder layout inside the zip works. The notebook finds the 7 TSV files wherever they are, and unpacks the archive itself if Kaggle left it zipped.
-
-### 4.2 Create the notebook
-1. On kaggle.com go to **Create → New Notebook**, then **File → Import Notebook**, and upload `kaggle/amazon_ml_kaggle.ipynb` (download it from GitHub first).
-2. In the right-hand panel, set **Accelerator → GPU T4 x2** and **Internet → On**. Internet requires a phone-verified account.
-3. **Add Input → Datasets → Your Datasets →** `amazon-ml`.
-4. Add the Hugging Face token for checkpoints:
-   - Go to **Add-ons → Secrets → Add Secret**.
-   - Set Label to `HF_TOKEN`. Set Value to the part after `HF_TOKEN=` in your local `.env`; the token needs **write** access.
-   - Tick the secret's checkbox so it is attached to this notebook.
-5. In the first code cell, check `TEAM_NAME` (`neural_nexus`) and `DATASET_SLUG`.
-
-### 4.3 Run
-- **Rehearsal first:** set `RUN_SMOKE_FIRST = True` and `RUN_FULL = False`, then **Run All**. It takes about 10–15 minutes and runs the *full-run config* on a 5k-entity sample: the real cross-encoder on both GPUs, plus a real Hugging Face save → restore → skip round trip. It must end with `SMOKE TEST PASSED`.
-- **Full run:** set `RUN_SMOKE_FIRST = False` and `RUN_FULL = True`, then **Save Version → Save & Run All (Commit)**. It keeps running after you close the browser. Kaggle stops any session at 12 hours.
-- **Results:** open the version's **Output** tab. It contains `matching_results.tsv` (upload this to the portal), `neural_nexus_submission.zip`, `neural_nexus_models.tar.gz`, `reports/` (out-of-fold F0.5 and so on) and `logs/`.
-
-### 4.3.1 Checkpoints and resuming (`ber/checkpoint.py`)
-- **What gets saved:** with the token, every finished stage's outputs are pushed together with its completion marker, as one commit, to the **private** dataset repo `<hf-user>/amazon-ml-ber-work`, folder `full/`. Only changed files are uploaded.
-- **Mid-stage progress:** the long stages also save their finished pieces while they run, and a later attempt keeps them:
-  - `block` saves per country.
-  - `prerank` saves its trained models, then its scored chunks every `prerank.sync_every` chunks.
-  - `features` saves its shards every `features.sync_every` shards.
-  - The cross-encoder saves each trained half, and its scored parts every `ce.sync_minutes`.
-
-  Each piece is written atomically: to a `.tmp` file first, then renamed. A *plan* file records row counts, chunk sizes and the model id, and a piece is reused only when its plan matches. So a crash never leaves a half-written piece that looks finished, and scores from another model or chunk size are never mixed in.
-- **Resuming:** if a session stops (12-hour limit, crash, lost connection), commit the notebook again (**Save & Run All**). The first stage call finds an empty work dir, downloads the checkpoint, prints `restored … finished stages: …`, skips those stages and continues inside the interrupted stage from its last saved piece.
-- **Out of memory:** if a stage is killed for memory (exit -9/137, -6/134, or 75 from a Python `MemoryError`), the notebook repeats it at once in the same session with lower-memory settings (`LOW_MEMORY_LEVELS` in `scripts/kaggle_runner.py`, two levels). The retry uses fold models one at a time, smaller training samples and fewer workers. The local work dir is intact, so the retry continues where the killed attempt stopped, with no re-download. Separately, fold models train concurrently only when both copies fit in half the free RAM.
-- **Tracks (experiments on top of a finished run):** a track config sets `checkpoint.restore_from` (the finished run's
-  folder, e.g. `full`, only ever read) and `checkpoint.start_from` (the first stage to re-do).
-  - The track restores that run's outputs of the earlier stages only, plus any `keep_stages`. Outputs, resume
-    state and completion markers of the re-done stages are never restored, so a re-done stage cannot pick up the
-    old results.
-  - It writes its own progress to its own folder (`checkpoint.prefix`) and resumes from there after a crash.
-  - Ready-made tracks: `configs/track0.yaml` (CPU session: new decision layer + error analysis) and
-    `configs/track_a.yaml` (GPU: matchers re-trained from `r1`). Select one with `CONFIG` in the notebook.
-  - Two tracks with different prefixes can run at the same time on two accounts.
-- **Fresh start:** `FRESH_START = True` deletes the saved progress and starts over. Use it after changing code or settings that affect earlier stages, otherwise stale restored stages are reused.
-- **Safety:** the code refuses to upload to a **public** repo, because the checkpoint contains competition-derived data. It reads only `HF_TOKEN` and never prints it.
-- **Failures:** an upload failure is logged and retried after the next stage. A missing token just turns checkpointing off.
-- **Locally:** set `checkpoint.enabled: true` (`--set checkpoint.enabled=true`); the token is then read from `.env`.
-
-### 4.3.2 Progress bars and the 12-hour budget (`ber/progress.py`)
-Every finished stage prints two bars, and the notebook repeats them every 5 minutes while a stage runs, with the latest log line so you can see it is alive:
-
-```
-PIPELINE  ███████░░░░░░░░░░░░░░░░░  29%  stage 6/16: prerank | worked 2h54m | remaining ~7h00m (estimate)
-SESSION   ██████░░░░░░░░░░░░░░░░░░  25%  of the 12h limit used (2h57m) | 9h02m left | pipeline projected to end at ~9h57m
-```
-- **How it works:** it reads the completion markers the pipeline already writes, so it cannot drift from what actually ran. Each stage has a rough weight, rescaled by how long finished stages really took.
-- **Accuracy:** the first number is only a rough prior (about 5 h). By the time `features` starts, it is typically within a few percent.
-- **Overrun warning:** if the projection exceeds the limit, the line ends with `!! may not finish in this session -> commit again to resume from the checkpoint`.
-- **Weekly quota:** Kaggle's weekly GPU-hour counter is not visible from code. It is shown in Kaggle's own notebook UI.
-- **Elsewhere:** the CLI prints the same PIPELINE bar after every stage, on AWS or locally.
-
-### 4.3.3 2-hop expansion is on
-It adds candidates found through a S1's already-confident records. It is applied only if it measurably raises the candidate ceiling, because extra candidates also add noise. On the 5k sample it added +0.00002 to +0.00005 of ceiling, and forcing it on lowered the sample score slightly (0.99740 vs 0.99800), so the gate declines there. On the real data it will apply it only if it finds a real gain. The decision is logged as `2-hop (...): ... gain +X, needs >= 0.00050 -> use=True/False` and saved in `work/models/prerank/expand.json`.
-
-### 4.4 What `configs/kaggle.yaml` changes
-Only scale and speed settings change; the code path is the same as on AWS.
-
-| Setting | Kaggle value | Why |
+| Setting | Final value | Meaning |
 |---|---|---|
-| Folds | 4 instead of 5 | Time |
-| GBDT | XGBoost on GPU instead of LightGBM on CPU | Kaggle has only 4 CPU cores |
-| Random projections / kNN | 192-d instead of 256-d; neighbours 30/3 and 20/3 instead of 50/5 and 30/5 | RAM and time: 40% fewer candidates to score (§4.4.1) |
-| Exact-key blocks | At most 50 S1 and 5,000 pairs per block (instead of 200 and 20,000) | Memory. Measured on the full US train data: larger blocks are generic names that add only look-alikes. |
-| Model training | Sample of 500k entities | Memory. Every pair is still scored. |
-| 2-hop expansion | On, but self-gated: decided on a 250k-entity probe, run on everything only if it raises the candidate ceiling by ≥ 0.0005 | Costs minutes if it does not help; never lowers accuracy when it does not help (§4.3.2) |
-| Projection vectors | Saved to the scratch disk (~10 GB of the 1.2 TB), not checkpointed; rebuilt on demand | 2-hop needs them |
-| Cross-encoder | `intfloat/multilingual-e5-small` (MIT, 118M parameters) on both T4s, fp16 | Time |
-| Work files | On the scratch disk, not the 20 GB `/kaggle/working` | Disk |
-
-### 4.4.1 Accuracy: Kaggle configuration vs the AWS configuration
-There **is** a difference. Some settings were reduced to fit the time and memory of a Kaggle session. What was measured and what was not:
-
-**Measured** (18,000 train entities, identical data; "ceiling" = best achievable macro F0.5 of the candidate set, which no later stage can exceed):
-
-| Blocking settings | Ceiling | Pairs/S1 |
-|---|---|---|
-| AWS defaults (256-d, k 50/5 and 30/5) | 0.99954 | 95 |
-| Kaggle before 26 Sep (128-d, k 30/3 and 20/3) | 0.99912 | 57 |
-| **Kaggle now (192-d, k 30/3 and 20/3)** | **0.99935** | **57** |
-| 256-d, same k (not used: ~25 GB RAM at full scale) | 0.99941 | 57 |
-| 192-d + reverse-k back to 5 (not used) | 0.99937 | 70 |
-
-- At full scale the loss is likely larger, because more look-alike records compete for the same neighbours. Measured: −0.00019 at 3k entities and −0.00042 at 18k, so it grows with size. A rough extrapolation says a few tenths of a point at 2.2M entities. That is an upper bound on the score impact.
-- **What to watch in the real run:** the `train union: {'union_ceiling': ...}` log line after `block`. If it is below about 0.995, raise the neighbour counts (`blocking.a1/n1.k_fwd`) at the cost of more scoring time.
-- The tighter exact-key block caps (50 S1 / 5,000 pairs instead of 200 / 20,000) had no effect at 18k entities. On the real US train data, 3.0% of true pairs sit in name-key blocks that the tighter caps drop. Almost all are still found through the address channels; the rest (missing address) are ambiguous among 50-200 same-name entities anyway.
-
-**Not measured** (they need the real data or GPUs I do not have; each is expected to cost little, none can raise the score):
-- **Cross-encoder:** `multilingual-e5-small` (118M, not a reranker) trained on up to 300k positives, instead of `bge-reranker-v2-m3` (568M, a pretrained multilingual reranker) on 1.5M. This is the largest deliberate downgrade of the neural part. It is only one input to round 2.
-- **GBDT:** XGBoost on GPU instead of LightGBM; 4 folds instead of 5; training on 500k entities (400k for the pre-ranker) instead of 800k (600k). On the 5k sample the two setups scored within noise of each other.
-- **Lookup tables** are mined from 1.5M pairs instead of 3M, so a few rare transliteration entries may fall below the support threshold.
-
-### 4.4.2 Using both GPUs
-| Stage | What runs on both GPUs |
-|---|---|
-| `block`, `expand` (nearest-neighbour search) | The index is copied to each GPU and the query chunks are shared out. The result is identical to a single-GPU run (exact top-k, independent chunks). |
-| `prerank`, `r1`, `r2`, `gate` (XGBoost) | The fold models are independent, so two train at once, one per GPU. Saved models are also used for prediction on the GPU. |
-| `ce_train`, `ce_infer` (cross-encoder) | The two cross-fitted halves run as separate processes, one per GPU, instead of PyTorch `DataParallel`. |
-| Everything else (parsing, features, decision layer) | CPU only (4 cores). |
-
-- **Safety:** each path falls back to one GPU (or the sequential path) if a worker fails, for example on out-of-memory. What was tested: correctness of the search and of concurrent training (identical to single-GPU results), the failure fallbacks, and the worker orchestration, using simulated devices. Not tested: real two-GPU behaviour, which the notebook rehearsal checks.
-- **Rehearsal:** it prints `Multi-GPU paths exercised: OK / NOT USED` for the three paths above, from the log.
-- **Kill switch:** `EXTRA_OVERRIDES = ["run.max_gpus=1"]` forces single-GPU behaviour in every stage. Per-stage caps: `blocking.knn.max_gpus`, `<stage>.gbdt.max_gpus`, and `ce.parallel_halves: false`.
-
-### 4.5 If the 12-hour limit is tight
-Measured on Kaggle (2× T4): `block` takes about 2 h 40 min (exact kNN over ~12.5M train and ~11.7M test records, four searches per country, both GPUs near 100%). The later stages have not been measured at full scale; the estimate is 5–6 h. The notebook prints the session time used after every stage. To shorten a run:
-- Set `USE_CROSS_ENCODER = False`. This saves roughly 1–1.5 hours.
-- Set `EXTRA_OVERRIDES = ["ingest.train_s1_frac=0.6"]` to train on 60% of the train clusters. The test set is never subsampled.
-- Set `EXTRA_OVERRIDES = ["r1.gbdt.rounds=1000", "r2.gbdt.rounds=1000"]`.
-
-With Hugging Face checkpoints on, a session that hits the limit loses at most the last few minutes of the stage that was running: commit again and it resumes (§4.3.1). Without checkpoints, the next run starts over.
+| `blocking.rp_dim`, `blocking.a1/n1` | 192; k 30/3, 20/3 | TF-IDF projection size; neighbours per S1 / per record in the address and name+address channels |
+| `blocking.keyblock` | ≤ 50 S1, ≤ 5,000 pairs | exact-key block caps (generic names are dropped) |
+| `prerank.ceiling_tol` | 0.0002 | allowed loss of the train candidate ceiling when choosing the pre-ranker floor |
+| `expand` | self-gated | 2-hop expansion, used only if it raises the train ceiling by ≥ 0.0005 (it did not) |
+| `r1.sample_entities` | 800k | training entities of round 1 |
+| `r2.sample_entities`, `r2.bags` | 700k, 3 | training entities per round-2 bag; number of bags averaged |
+| `ce.model_name`, `ce.band` | e5-small, [0.05, 0.95] | cross-encoder and the round-1 score band it scores |
+| `features.admin_strip` | on, `pairs: false` | address admin level of countries without labels, ignored in round-2 consensus only |
+| `decision.grid`, `decision.expected` | | search space of the per-country set rules |
+| `decision.overrides.france` | κ 1.2 | France's set rule (no labels; see the documentation) |
+| `*.gbdt` | XGBoost, 4 folds | backend (`xgboost` / `lightgbm`), device (`auto` / `cpu` / `cuda`), rounds, parameters |
+| `run.max_gpus` | 0 | 0 = use all GPUs; 1 = single-GPU behaviour everywhere |
+| `run.n_workers` | -1 | CPU workers (-1 = all cores) |
+| `checkpoint.enabled` | false | optional private Hugging Face mirror of `work/` |
 
 ---
 
-## 5. Full run on AWS
+## 7. Hardware notes
 
-### 5.1 Machines
-
-| Box | Suggested instance | Used for |
-|---|---|---|
-| CPU | `r7i.16xlarge` (64 vCPU, 512 GiB) or `r7i.8xlarge` (256 GiB) | every stage except the neural ones (all stages stream, so RAM mostly sets how large the training samples can be) |
-| GPU | `g6e.2xlarge` (L40S 48 GB) or `p4d`/`p5` | kNN (much faster on GPU), cross-encoder train/infer, optional bi-encoder |
-
-A single GPU box with enough RAM (for example `g6e.16xlarge`, 512 GiB) can run everything.
-
-- **Request the GPU service quota first.** New accounts often start at zero for G/P instances, and approval can take hours.
-- **Without a GPU:**
-  - kNN falls back to multithreaded CPU matmul; set `blocking.knn.device: cpu`. This takes hours rather than minutes.
-  - Set `ce.enabled: false`.
-
-### 5.2 Commands
-
-The final submission uses `configs/final.yaml` (§0). `configs/default.yaml` is the larger development profile
-these machines were first sized for. From `code/business_entity_resolution/`, with the challenge data in
-`../../dataset/{train,test}` and `PYTHONPATH=$PWD/src`:
-
-```bash
-python -m ber.pipeline.run --config configs/final.yaml --stage all
-```
-
-The same run, stage by stage (useful for monitoring and for moving between boxes):
-
-```bash
-R="python -m ber.pipeline.run --config configs/final.yaml"
-$R --stage ingest,eda,mine,normalize        # CPU
-$R --stage dense                            # no-op unless blocking.dense.enabled (GPU)
-$R --stage block                            # GPU recommended (kNN); logs train union ceiling / pair recall
-$R --stage prerank,expand                   # CPU: OOF pre-ranker, floor tuned on ceiling, 2-hop
-$R --stage features                         # CPU: round-1 features (sharded, all cores)
-$R --stage r1                               # CPU: OOF round-1 LightGBM
-$R --stage ce_train                         # GPU: two cross-fitted halves
-$R --stage ce_infer --split train --shard 0/2   # GPU: shard across GPUs/boxes if you like
-$R --stage ce_infer --split train --shard 1/2
-$R --stage ce_infer --split test  --shard 0/1
-$R --stage r2,r2bag,gate,tune,predict,outputs   # round 2 (+ bagging), gate, thresholds, submission files
-```
-
-- **Moving work between boxes:** `aws s3 sync work/ s3://<bucket>/work/` on one box and the reverse on the other.
-- **Re-running a stage:** add `--force`.
-- **Continuing from a stage:** `--from <stage>`.
-- **Changing a config value on the command line:** `--set key.sub=value`.
-
-### 5.3 Outputs
-
-- `../../output/matching_results.tsv` is the file that gets scored.
-- `../../output/candidate_pairs.tsv` is the final candidate set. It is written *after* the 2-hop expansion, so every match is guaranteed to be one of the candidates.
-- Both are checked with `utils/validate_submission.py` automatically.
-- Reports:
-  - `work/models/oof_report.json`: out-of-fold macro F0.5 by profile, singleton / non-singleton, true group size, best achievable score.
-  - `work/models/*/oof_metrics.json` and `importance.json`
-  - `work/models/prerank/floor.json` (best achievable score of the union vs chosen floor)
-  - `work/models/prerank/expand.json` (2-hop gain)
-  - `work/models/stress_check.json`
-  - `work/models/thresholds.json`
+- **GPUs:** the kNN search copies the index to every GPU and shares out query chunks (exact top-k, identical to a
+  single-GPU result); XGBoost fold models train concurrently, one per GPU; the two cross-encoder halves run as one
+  process per GPU. Each path falls back to one GPU or the sequential path if a worker fails.
+  `--set run.max_gpus=1` forces single-GPU behaviour.
+- **No GPU:** `--set blocking.knn.device=cpu` (multithreaded matmul, many hours) and XGBoost on CPU (automatic). The
+  cross-encoder on CPU is slow; `--set ce.enabled=false` skips it at some accuracy cost.
+- **Less RAM:** lower `r1/r2.sample_entities` and `max_train_rows`, `prerank.max_train_rows` and
+  `features.join_rows`. This changes the trained models slightly.
 
 ---
 
-## 6. Leaderboard probes
+## 8. Reproducibility, fair play and licences
 
-The doc's §12 plan is to spend submissions only on questions that validation cannot answer. Each probe writes to `../../output/probes/<name>/` and leaves the main submission untouched.
-
-```bash
-R="python -m ber.pipeline.run --config configs/default.yaml"
-$R --stage outputs --probe all_empty                                            # public singleton rate
-$R --stage predict,outputs --probe fr_empty  --set decision.overrides.france.empty=true
-$R --stage predict,outputs --probe fr_strict --set decision.overrides.france.delta_shift=0.05
-$R --stage predict,outputs --probe fr_loose  --set decision.overrides.france.delta_shift=-0.05
-```
-
-- **France score:** F_France ≈ s_F + (LB_main − LB_fr_empty) / w_F, where w_F is France's share of S1 entities (≈0.15) and s_F is its singleton rate (≈0.056).
-- **Adopting a winning override:** put it under `decision.overrides` in the config and re-run `predict,outputs`.
+- **Deterministic:** seeded RNGs; every model input and ranking sorted by `(s1_uid, rec_uid)` with explicit
+  tie-breaks; cuBLAS pinned with `CUBLAS_WORKSPACE_CONFIG`. Two from-scratch sample runs give byte-identical
+  outputs. GPU floating point can still differ in the last digits across GPU models.
+- **No external data:** lookup tables are mined from training pairs only (each entry supported by ≥ 20 distinct S1
+  entities); hand-written rules are abbreviation knowledge only (street types, legal forms); the address admin
+  level of a country without labels is detected from that split's own addresses (`features/admin.py`). No
+  gazetteers, geocoders, APIs or business databases.
+- **Models:** XGBoost trees; `intfloat/multilingual-e5-small` (MIT, 118M parameters), fine-tuned on the training
+  data only. Far below the 8B limit.
 
 ---
 
-## 7. Reproducibility and audit
+## 9. How the submitted files were produced
 
-- **Deterministic:**
-  - Seeded RNGs; LightGBM runs with `deterministic` and `force_col_wise`.
-  - Every model input and ranking is sorted by `(s1_uid, rec_uid)`, and all tie-breaks are explicit.
-  - Two from-scratch smoke runs produce byte-identical `matching_results.tsv` and `candidate_pairs.tsv`.
-  - cuBLAS is pinned with `CUBLAS_WORKSPACE_CONFIG`.
-- **Inference-only path (no retraining):**
-  1. Restore `work/tables.pkl` and `work/models/` from the models bundle (`bash scripts/package_submission.sh <team> --with-models` creates it).
-  2. Run:
-     ```bash
-     python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all
-     ```
-  - This processes the test split only and loads every model, calibrator, floor and threshold.
-  - It was verified to reproduce the full run's outputs byte for byte.
-- **No external data:**
-  - Lookup tables are mined from training pairs only, and each entry must be supported by ≥ 20 distinct S1 entities.
-  - Hand-written rules are abbreviation knowledge only (street types, legal forms).
-  - For a country without training labels (France), the address administrative level is detected from that split's own addresses (`features/admin.py`), not from a gazetteer.
-  - No gazetteers, geocoders or APIs are used.
-- **Model licences and size:**
-  - LightGBM / XGBoost: trees only.
-  - `BAAI/bge-reranker-v2-m3`: Apache-2.0, 568M parameters.
-  - `intfloat/multilingual-e5-small` (the cross-encoder of `kaggle.yaml` / `final.yaml`, i.e. the final submission): MIT, 118M parameters.
-  - Optional `intfloat/multilingual-e5-base`: MIT, 278M parameters.
-  - Total stays well under 8B parameters.
+The submitted files were computed on Kaggle (2× T4, 12 h sessions) in checkpointed steps: each step restored the
+finished stages of the previous ones and re-did the rest. `configs/config.yaml` merges the settings of the final
+chain into one from-scratch run.
 
----
+| Step | Change | Train out-of-fold | Leaderboard |
+|---|---|---|---|
+| Full run | whole pipeline, round 1 / 2 on 500k entities | 0.98933 | 0.984819 |
+| A | round 1 re-trained on 800k entities | 0.98952 | — |
+| G | round 2 with competing-cluster features, 700k entities | 0.98959 | 0.985166 |
+| F | France admin level also ignored in round-1 features, France list sizes rescaled | same as G | 0.985031 (rejected) |
+| **H** | **round-2 bagging (3 samples), on top of G** | **0.98962** | **0.985252 (final)** |
 
-## 8. Packaging
-
-```bash
-bash scripts/package_submission.sh <team_name>              # -> ../../<team_name>_submission.zip
-bash scripts/package_submission.sh <team_name> --with-models   # + ../../<team_name>_models.tar.gz
-```
-
-On Kaggle the notebook's last cell runs this for you. It sets `WORK_DIR`, `DATA_DIR` and `OUT_DIR` because those directories live on scratch disk there; `RESULTS_DIR` can also be overridden.
-
-Fill in `docs/Documentation Template.md` before packaging; it is copied into the zip as `Documentation_template.md`.
-
-The local layout (`code/business_entity_resolution/`) is the layout the challenge requires inside the zip, so the same paths work in both places.
-
----
-
-## 9. Key configuration knobs (`configs/default.yaml`)
-
-| Knob | Meaning |
-|---|---|
-| `blocking.a1/n1.k_fwd/k_rev` | Neighbours per S1 / per record in the address and name+address channels |
-| `blocking.keyblock.*` | Exact-key block caps and the document-frequency band for locality tokens |
-| `blocking.dense.enabled` | Optional bi-encoder channel (enable only if the best achievable score needs it) |
-| `blocking.save_vectors` | Keep projection vectors on disk (needed by 2-hop expansion and the S1↔S1 diagnostic; rebuilt on demand if missing) |
-| `prerank/r1/r2.sample_entities` | S1 entities whose rows train each GBDT; scoring always covers every pair |
-| `prerank.chunk_rows`, `features.shard_rows`, `features.join_rows` | Rows processed at a time (lower them if memory is tight) |
-| `gbdt_base.backend`, `*.gbdt.device` | `lightgbm` or `xgboost`; XGBoost device `auto`, `cpu` or `cuda` |
-| `ingest.train_s1_frac` | Train on a fraction of the train clusters (time valve; test is never subsampled) |
-| `expand.probe_entities`, `expand.min_gain` | 2-hop: decide on a sample of N train entities (0 = all); required ceiling gain |
-| `run.max_gpus` | Global GPU cap: 0 = use all GPUs (default), 1 = single-GPU everywhere |
-| `ce.parallel_halves` | Cross-encoder halves as one process per GPU (needs >= 2 GPUs) |
-| `run.cleanup` | Delete the candidate-union files after the pre-ranker has used them |
-| `checkpoint.*` | Private Hugging Face checkpointing of the work dir: `enabled`, `repo_id`/`repo_name`, `prefix` (one folder per independent run), `token_env`, `exclude` |
-| `prerank.ceiling_tol` | Allowed best-achievable-score loss when choosing the pre-ranker floor (default 0.0002) |
-| `expand.*` | 2-hop expansion; applied to test only if it raised the train best achievable score by `min_gain` |
-| `r1/r2.monotone` | Monotone-constraint ablation for France robustness |
-| `ce.*` | Cross-encoder model, band, batch sizes |
-| `decision.caps` | Maximum S2 (5) / S3 (6) records per S1, verified on train |
-| `decision.t_add_base` | Break-even thresholds for adding the k-th member (doc Appendix B) |
-| `decision.grid` | Tuning grid for `kappa` (first-member rule), `t_min`, `delta` |
-| `decision.fallback_profile` | Thresholds and calibration used for profiles with no training data (France) |
-| `stress.*` | Unmatched-density stress test (drop 19% of train S1s) used for robust tuning |
+On sample data, this chain and one from-scratch run of the same settings give byte-identical outputs. On the full
+data, the one difference is that the chain reused the cross-encoder scores of the full run, whose score band came
+from its 500k-entity round 1. The Kaggle driver notebook is not part of this package (it only called this pipeline).
 
 ---
 
 ## 10. Troubleshooting
 
-- **Out of memory:** on Kaggle the notebook retries a killed stage with lower-memory settings automatically (§4.3.1). If it still fails, lower `prerank.max_train_rows`, `r1/r2.max_train_rows`, `*.sample_entities` and `features.join_rows`. In `block`, also lower `blocking.a1/n1.k_fwd`. Changing `prerank.chunk_rows` or `features.shard_rows` discards that stage's saved partial progress, because they are part of its plan.
-- **Kaggle "missing train_source1.tsv …":** the dataset is not attached (**Add Input**), or `DATASET_SLUG` does not match its folder name under `/kaggle/input`.
-- **Kaggle `git clone` fails:** switch **Internet** on in the notebook settings (it needs a phone-verified account).
-- **Slow kNN:** check that the log line `knn: ... on cuda` appears; tune `blocking.knn.mem_gb` to fit your GPU.
-- **Validator warning (a match outside the candidates):** this cannot happen by construction; `outputs` asserts it. If it appears, re-run `expand` and `features` so both files come from the same run.
-- **LightGBM missing:** the wrapper falls back to XGBoost automatically (`gbdt_base.backend`).
+- **Out of memory:** see §7 "Less RAM". Changing `prerank.chunk_rows` or `features.shard_rows` discards that stage's
+  saved partial progress (they are part of its resume plan).
+- **Slow blocking:** check that the log shows `knn: ... on cuda`; `blocking.knn.mem_gb` sets the GPU memory used per
+  query chunk.
+- **`No module named ber`:** run `export PYTHONPATH=$PWD/src` from `code/business_entity_resolution/`.
+- **Cross-encoder download fails:** the machine needs internet access to huggingface.co once (or a pre-downloaded
+  model: `--set ce.model_name=/path/to/multilingual-e5-small`).
+- **Validator skipped:** it is looked up at `../../utils/validate_submission.py`; set `paths.validator` otherwise.

@@ -82,12 +82,16 @@ metric-optimal set decision (hybrid, collective).
 **Candidate pairs generated:**
 - Union: 179M (train, 81 per S1) and 160M (test, 92 per S1) pairs.
 - A GBDT pre-ranker on cheap similarity and channel features (trained out-of-fold) keeps pairs with
-  p ≥ 0.0005 → **10.8 candidates per S1** on train. The test output has **22.47M** candidate pairs (13.0 per S1).
+  p ≥ 0.0005 → **10.8 candidates per S1** on train.
+- **Test (`candidate_pairs.tsv`): 22,465,264 candidate pairs, 13.0 per S1**, out of 6.72 trillion same-country
+  S1 × record pairs: a **reduction ratio of 99.99967%** (one pair in 299,000 is kept). This is exactly the set the
+  matching models score.
 
 **How true matches were protected:**
 - The pre-ranker floor is tuned on the train *candidate ceiling* (the best macro F0.5 achievable from the
   candidates). Union ceiling 0.99687 → final 0.99671.
-- Every channel is recall-first; the union pair recall is 98.96%.
+- Every channel is recall-first; the union pair recall is 98.96%, and the final candidates keep **98.91% of the
+  true train pairs**.
 - 59% of the remaining lost pairs are records without an address whose name is shared by several S1s.
 
 ## 4. Matching Model
@@ -145,6 +149,8 @@ probabilities.
 | + France round-1 adaptations (Track F, rejected) | same as Track G (only France changes) | 0.985031 |
 | + round-2 bagging, 3 samples (Track H, **final**) | **0.98962** (US 0.98991, India 0.98918) | **0.985252** |
 
+- **F_0.5 score (macro): 0.98962** on train out-of-fold (all 2.21M train S1, 4 entity-grouped folds; US 0.98991,
+  India 0.98918); **public leaderboard 0.985252**. The best achievable score from the candidates is 0.99671.
 - Final model: precision 0.9985, recall 0.9708. Singleton F0.5 0.9937, other entities 0.9894.
 - **Per country on the leaderboard:** four diagnostic submissions blanked or invalidated one country's rows.
   Their exact scores are consistent with India/US scoring as out-of-fold, and with **France ≈ 0.960**: about 40%
@@ -177,21 +183,21 @@ probabilities.
 `code/business_entity_resolution/`:
 - `src/ber/`: package with `io`, `normalize`, `mining`, `blocking`, `features`, `models`, `decision`, `eval` and
   `pipeline`.
-- `configs/`: `final.yaml` holds the final settings; `kaggle.yaml` / `default.yaml` are the base profiles.
-  `track_*.yaml` are the checkpointed Kaggle runs that produced the final file (full → track_a → track_g →
-  track_h).
-- `scripts/`: Kaggle runner, packaging.
-- `README.md`, `requirements*.txt`.
+- `configs/config.yaml`: every setting of the final submission.
+- `scripts/`: quick sample check (`smoke_test.sh`), sample builder and scorer, packaging.
+- `README.md` (machine, setup, commands, runtime, outputs), `requirements.txt` (pinned), `environment.yml`.
 
 **Entry points:**
-- **Train + predict:** `python -m ber.pipeline.run --config configs/final.yaml --stage all` (data in
-  `../../dataset/{train,test}`). It writes `../../output/matching_results.tsv` and `candidate_pairs.tsv` and runs
-  the official validator.
-- **Inference on new test data** with the trained models (`<team>_models.tar.gz` extracted into `work/`):
-  `python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all`.
+- **Train + predict:** from `code/business_entity_resolution/`, with `PYTHONPATH=src` and the data in
+  `../../dataset/{train,test}`: `python -m ber.pipeline.run --config configs/config.yaml --stage all`. It writes
+  `../../output/matching_results.tsv` and `candidate_pairs.tsv` and runs the official validator. About 12 h on
+  4 CPU cores + 2× T4; every stage resumes after an interruption.
+- **Inference on new test data** with the trained models (`neural_nexus_models.tar.gz` extracted into `work/`):
+  `python -m ber.pipeline.run --config configs/config.yaml --set run.inference_only=true --stage all`.
 - Verified on sample data:
   - inference-only from the models bundle reproduces the full run byte for byte;
-  - the Kaggle checkpointed track chain reproduces a from-scratch `final.yaml` run byte for byte.
+  - the checkpointed Kaggle runs that produced the submission (full → A → G → H) reproduce one from-scratch run of
+    the same settings byte for byte.
 
 ### B. Additional Results
 - **Decision layer:** exact expected-F0.5 rule vs grid rule = +0.00001 (tie). A 2-hop expansion gained +0.00013

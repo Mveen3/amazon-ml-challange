@@ -1,0 +1,202 @@
+# Configuration of the final submission (public leaderboard 0.985252, train out-of-fold macro F0.5 0.98962).
+#
+#   python -m ber.pipeline.run --config configs/config.yaml --stage all          # train + predict, from scratch
+#   python -m ber.pipeline.run --config configs/config.yaml --set run.inference_only=true --stage all
+#                                                    # test split only, with the trained models in work/models
+#
+# Sized for 1-2 GPUs (16 GB each), 4+ CPU cores and 32 GB of RAM (measured peak 30.3 GB); a larger machine runs it
+# unchanged. Any value can be overridden on the command line with --set key.sub=value.
+# Relative paths resolve against code/business_entity_resolution/ (the parent of configs/).
+paths:
+  data_dir: ../../dataset                  # dataset/train/*.tsv and dataset/test/*.tsv
+  work_dir: work                           # intermediate files and trained models (~100 GB at full scale)
+  output_dir: ../../output                 # matching_results.tsv + candidate_pairs.tsv
+  validator: ../../utils/validate_submission.py   # official validator, run after the outputs (skipped if absent)
+
+run:
+  extra_stages: [errors]         # after the outputs: train out-of-fold error analysis (work/models/error_analysis.md)
+  seed: 42
+  n_workers: -1                  # -1 = all cores
+  cleanup: true                  # delete the candidate-union files once the pre-ranker has consumed them
+  inference_only: false          # true: test split only, every model loaded from work_dir/models
+  max_gpus: 0                    # 0 = every stage uses all GPUs it can; 1 = force single-GPU behaviour everywhere
+
+checkpoint:                      # optional mirror of the work dir to a PRIVATE Hugging Face dataset repo, used for
+  enabled: false                 # resumable cloud sessions (ber/checkpoint.py); not needed to reproduce the results
+  repo_name: amazon-ml-ber-work
+  prefix: final
+  token_env: HF_TOKEN
+  exclude: ["*/feats/r1_in/*", "*/_norm_parts/*", "*.tmp", "*.tmp/*", "rp_matrix.npy", "_last_config.json",
+            "*/vec/*/comb_rp.npy", "*/vec/*/addr_rp.npy"]
+
+ingest:
+  train_s1_frac: 1.0             # <1.0 keeps that fraction of train S1 clusters (+ same share of unmatched records)
+
+folds:
+  n_folds: 4                     # entity-grouped folds for every out-of-fold model
+  neural_halves: [[0, 1], [2, 3]]   # cross-fitting halves of the cross-encoder
+
+normalize:
+  chunk_size: 50000
+
+mining:                          # lookup tables (abbreviations, aliases) mined from training pairs only
+  enabled: true
+  max_pairs: 1500000
+  min_support: 20                # distinct S1 entities supporting a mapping (leak safety)
+  min_share: 0.6
+  affix_rate: 0.3
+
+blocking:
+  ngram: [3, 3]
+  hash_features: 262144
+  rp_dim: 192                    # measured: 128-d loses 0.00013 of candidate ceiling, 192-d recovers it
+  vector_chunk: 100000
+  name_addr_weight: 0.5          # N1 vector = [name, 0.5 * address]
+  save_vectors: true             # keep RP vectors on disk (read by the 2-hop expansion)
+  knn: {device: auto, mem_gb: 3.0, max_gpus: 0}   # exact top-k cosine on GPU (all visible GPUs), CPU fallback
+  a1: {k_fwd: 30, k_rev: 3, min_score: 0.15}      # address channel: k per S1 / per record
+  n1: {k_fwd: 20, k_rev: 3, min_score: 0.15}      # name + address channel
+  keyblock: {max_block_s1: 50, max_block_pairs: 5000, admin_df_min: 30, admin_df_max: 200000,
+         loc_tokens: 3, rare_tokens: 2, num_tokens: 2}
+  dense:                         # optional bi-encoder channel (not used)
+    enabled: false
+    model_name: intfloat/multilingual-e5-base
+    device: auto
+    max_pairs: 2000000
+    batch_size: 256
+    lr: 2.0e-5
+    scale: 20.0
+    max_len: 64
+    infer_batch_size: 1024
+    k_fwd: 30
+    k_rev: 5
+    min_score: 0.3
+
+gbdt_base: &gbdt                 # shared GBDT settings (XGBoost, GPU when available)
+  backend: xgboost
+  device: auto                   # auto | cpu | cuda
+  max_gpus: 0                    # fold models train concurrently, one per GPU (0 = all GPUs)
+  rounds: 2000
+  early_stop: 100
+  max_entities: 800000           # training S1 entities per fold (whole entities)
+  es_frac: 0.05
+  params: {learning_rate: 0.05, num_leaves: 255, min_data_in_leaf: 100, feature_fraction: 0.8,
+           bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
+
+prerank:                         # GBDT pre-ranker on cheap features: trims the candidate union
+  sample_entities: 400000        # S1 entities whose union rows train the pre-ranker (scoring covers all)
+  gbdt:
+    <<: *gbdt
+    rounds: 600
+    max_entities: 400000
+    params: {learning_rate: 0.08, num_leaves: 63, min_data_in_leaf: 200, feature_fraction: 0.9,
+             bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
+  floor_grid: [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.08, 0.12]
+  ceiling_tol: 0.0002            # the floor may cost at most this much of the train candidate ceiling
+  keep_rev_top: 2
+  floor_low: 0.0005
+  max_per_s1: 60
+  chunk_rows: 3000000            # union pairs scored per chunk (bounds RAM); part of the resume plan, keep fixed
+  max_train_rows: 10000000       # cap on training rows (entities = min(sample_entities, cap / union pairs per S1))
+  sync_every: 10
+
+expand: {enabled: true, conf: 0.9, k: 5, min_cos: 0.6, max_add: 10,
+         min_gain: 0.0005,       # 2-hop expansion applied only if it raises the train ceiling this much (it did not)
+         probe_entities: 250000} # decided on a sample of train S1s
+
+features:                        # round-1 pair features
+  density_norm: false            # r1 list-size counts divided by the country median
+  density_match: false           # countries without labels: r1 list-size counts put on the train scale (measured on
+                                 # the leaderboard together with admin_strip.pairs: -0.000135, so off)
+  admin_strip:                   # address admin level (regions, departments), detected from the data for countries
+    enabled: true                # without training labels (France), ignored in the round-2 consensus features
+    pairs: false                 # also in the round-1 pair features: rejected on the leaderboard (see density_match)
+    s1_last_share: 0.02          # components ending >= 2% of the country's S1 addresses (regions / states)
+    rec_share: 0.005             # record components in >= 0.5% of S2/S3 addresses ...
+    max_s1_ratio: 0.05           # ... that are (almost) absent from S1 addresses (departments / counties)
+  sync_every: 20
+  shard_rows: 300000             # pairs per feature shard (one worker task)
+  join_rows: 1500000             # pairs joined with parsed text at a time when writing shards
+  rare_df: 50                    # tokens with df <= rare_df count as "rare" in diff signatures
+
+r1:                              # round-1 pair model
+  sample_entities: 800000        # training S1 entities (out-of-fold / test scoring streams over all shards)
+  max_train_rows: 9000000        # cap on training rows (entities = min(sample_entities, cap / pairs per S1))
+  gbdt: *gbdt
+  monotone: []
+
+ce:                              # cross-encoder on the round-1 uncertain band (2 cross-fitted halves)
+  enabled: true
+  parallel_halves: true          # with >= 2 GPUs: one half per GPU
+  model_name: intfloat/multilingual-e5-small   # MIT licence, 118M parameters
+  device: auto
+  max_len: 128
+  batch_size: 128
+  infer_batch_size: 1024
+  lr: 2.0e-5
+  warmup: 0.05
+  epochs: 1
+  neg_ratio: 3
+  max_pos: 300000
+  band: [0.05, 0.95]             # round-1 score band that is scored
+  top_rank: 2
+  infer_chunk: 500000
+  part_rows: 250000
+  sync_minutes: 15
+
+r2:                              # round-2 pair model: round-1 score + cross-encoder + consensus + competing clusters
+  sample_entities: 700000        # per bag; 700k keeps the peak at ~30 GB of RAM
+  max_train_rows: 8000000
+  gbdt:
+    <<: *gbdt
+    max_entities: 700000
+  monotone: []
+  conf_tau: 0.8
+  close_gap: 0.1                 # S1s within this p1 of a record's best S1 count as close competitors
+  density_norm: true             # c1 list-size counts divided by the country median
+  top_members: 8
+  chunk_s1: 100000
+  bags: 3                        # 3 round-2 models on different 700k-entity samples, averaged (stage r2bag)
+
+gate:                            # entity-level P(S1 has >= 1 match)
+  density_norm: true             # g_ncand / g_n_owned divided by the country median
+  gbdt:
+    <<: *gbdt
+    rounds: 1500
+    max_entities: 3000000
+    params: {learning_rate: 0.05, num_leaves: 63, min_data_in_leaf: 100, feature_fraction: 0.9,
+             bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, max_bin: 255}
+
+decision:                        # per-S1 set selection, tuned on train out-of-fold macro F0.5 per country
+  fallback_profile: us           # thresholds/calibration for countries without training data (France)
+  max_members: 12
+  caps: {2: 5, 3: 6}             # verified maxima of S2 / S3 records per S1
+  # t_add_base[k] = expected-F0.5 break-even for adding a member when k are selected
+  t_add_base: [0.727, 0.727, 0.759, 0.771, 0.778, 0.782, 0.785, 0.787, 0.789, 0.790, 0.791, 0.792]
+  grid:
+    kappa: [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.7]
+    t_min: [0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
+    delta: [-0.35, -0.3, -0.25, -0.2, -0.15, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15]
+  expected:                      # exact expected-F0.5 set choice (decision/expected.py); used where it beats the grid
+    enabled: true
+    a: [0.8, 1.0, 1.25]          # sharpness of the member probabilities (logit scale)
+    b: [-0.5, 0.0, 0.5]          # bias on the logit (> 0 predicts more members)
+    u: [0.0, 0.1]                # expected true matches outside the candidate list (Poisson mean)
+    cond: [true]                 # member probabilities conditioned on the gate's P(has a match)
+    min_gain: 0.0001             # switch rules only for a clear out-of-fold gain
+  overrides:                     # France has no labels: the rule behind its measured leaderboard score (the US
+    france: {rule: heuristic, kappa: 1.2, t_min: 0.0, delta: 0.0}   # optimum it would inherit is flat in kappa)
+
+stress:                          # optional robustness check of the thresholds (its hypothesis was refuted: off)
+  enabled: false
+  drop_frac: 0.19
+  force: false
+
+s1s1:                            # optional S1<->S1 diagnostic stage (not part of --stage all)
+  queries: 200000
+  train_entities: 300000
+  gbdt:
+    <<: *gbdt
+    backend: lightgbm
+    rounds: 400
+    max_entities: 800000

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Build <team>_submission.zip in the layout the challenge requires:
 #   output/{matching_results.tsv,candidate_pairs.tsv}
-#   code/business_entity_resolution/{src,configs,scripts,kaggle,README.md,requirements*.txt,environment.yml}
+#   code/business_entity_resolution/{src,configs,scripts,README.md,requirements.txt,environment.yml}
 #   Documentation_template.md
 # and (optionally) a models bundle for the inference-only reproduction path.
 #
 #   bash scripts/package_submission.sh <team_name> [--with-models]
 #
-# Environment overrides (used on Kaggle, where data and work dirs live on scratch disk):
+# Environment overrides (when data and work dirs live elsewhere, e.g. on a scratch disk):
 #   WORK_DIR  pipeline work dir holding tables.pkl + models/  (default: <pkg>/work)
 #   DATA_DIR  competition data root with test/                 (default: <project>/dataset)
 #   OUT_DIR   where the zip / bundle are written               (default: <project>)
@@ -26,7 +26,7 @@ ZIPCODE="$DEST/code/business_entity_resolution"
 
 mkdir -p "$DEST/output" "$ZIPCODE"
 cp "$RESULTS/matching_results.tsv" "$RESULTS/candidate_pairs.tsv" "$DEST/output/"
-( cd "$PKG" && cp -r src configs scripts kaggle README.md requirements.txt requirements-kaggle.txt environment.yml \
+( cd "$PKG" && cp -r src configs scripts README.md requirements.txt environment.yml \
       "$ZIPCODE/" )
 find "$DEST/code" -name "__pycache__" -type d -prune -exec rm -rf {} +
 DOC="$ROOT/docs/Documentation_template.md"
@@ -36,7 +36,7 @@ cp "$DOC" "$DEST/Documentation_template.md"
 python3 "$ROOT/utils/validate_submission.py" --matching "$DEST/output/matching_results.tsv" \
     --candidate "$DEST/output/candidate_pairs.tsv" --test-dir "$DATA/test"
 
-# python's zipfile instead of the zip binary (not installed everywhere, e.g. some Kaggle images)
+# python's zipfile instead of the zip binary (not installed everywhere)
 ( cd "$STAGE" && python3 -m zipfile -c "${TEAM}_submission.zip" "${TEAM}_submission" )
 mkdir -p "$OUT"
 mv "$STAGE/${TEAM}_submission.zip" "$OUT/"

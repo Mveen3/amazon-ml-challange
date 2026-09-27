@@ -1,11 +1,10 @@
 """Command-line entry point.
 
-    python -m ber.pipeline.run --config configs/default.yaml --stage all
-    python -m ber.pipeline.run --config configs/default.yaml --stage features --force
-    python -m ber.pipeline.run --config configs/default.yaml --from r2
-    python -m ber.pipeline.run --config configs/default.yaml --stage ce_infer --split test --shard 0/4
-    python -m ber.pipeline.run --config configs/default.yaml --stage predict,outputs --probe fr_strict \
-        --set decision.overrides.france.delta_shift=0.05
+    python -m ber.pipeline.run --config configs/config.yaml --stage all
+    python -m ber.pipeline.run --config configs/config.yaml --stage features --force
+    python -m ber.pipeline.run --config configs/config.yaml --from r2
+    python -m ber.pipeline.run --config configs/config.yaml --stage ce_infer --split test --shard 0/4
+    python -m ber.pipeline.run --config configs/config.yaml --set run.inference_only=true --stage all
 
 Every stage writes its artefacts under ``paths.work_dir`` and a completion marker,
 so the pipeline resumes where it stopped; ``--force`` re-runs completed stages.
@@ -211,7 +210,8 @@ def run_stage(cfg, stage: str, args) -> dict | None:
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", default=str(Path(__file__).resolve().parents[3] / "configs" / "config.yaml"),
+                    help="YAML config (default: configs/config.yaml)")
     ap.add_argument("--stage", default=None, help="stage name, comma list, or 'all'")
     ap.add_argument("--from", dest="start", default=None, help="run the pipeline from this stage onwards")
     ap.add_argument("--split", default=None, choices=["train", "test", "both"])
