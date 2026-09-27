@@ -11,7 +11,7 @@ We resolve each Source-1 (S1) business to its Source-2/3 records in four steps:
 1. multi-channel blocking (character TF-IDF nearest neighbours on GPU, plus exact keys);
 2. a gradient-boosted pre-ranker that trims candidates without losing recall;
 3. three rounds of gradient-boosted pair classification around a small multilingual cross-encoder: round 2 bagged
-   over three entity samples, round 3 re-reading each S1's cluster from round 2's scores; plus an entity-level
+   over three entity samples, round 3 (also bagged) re-reading each S1's cluster from round 2's scores; plus an entity-level
    "has a match" gate;
 4. a per-entity set decision that directly targets macro F0.5.
 
@@ -132,8 +132,9 @@ metric-optimal set decision (hybrid, collective).
   entities), round 2 and the entity gate (P(has ≥ 1 match)).
 - Round 2 is bagged: three fold sets, each trained on a different 700k-entity sample (seeds 142, 1142, 2142).
   Their scores are averaged and recalibrated.
-- Round 3: one XGBoost fold set (700k entities, seed 342) on the round-2 features rebuilt from the bagged round-2
-  scores, plus the round-1 score. Its calibrated scores are final; the gate and thresholds are trained on them.
+- Round 3: XGBoost fold sets on the round-2 features rebuilt from the bagged round-2 scores, plus the round-1
+  score; bagged like round 2 (three 700k-entity samples, seeds 342, 1342, 2342, averaged and recalibrated). Its
+  calibrated scores are final; the gate and thresholds are trained on them.
 - Isotonic calibration per country; France uses the US calibration.
 
 **Threshold selection method:** a per-entity set rule tuned on train out-of-fold macro F0.5, per country:
@@ -142,7 +143,7 @@ metric-optimal set decision (hybrid, collective).
 - each record goes to its best S1 only.
 
 Final values:
-- India: κ = 0.8.
+- India: κ = 0.9, t_min = 0.4.
 - US: κ = 0.9.
 - France (no labels): its test probabilities are first shifted by −0.5 logits (density correction, §2.2), then
   pinned to κ = 1.2, t_min = 0, δ = 0, the rule behind its measured leaderboard score. The
@@ -162,19 +163,20 @@ probabilities.
 | + France round-1 adaptations (Track F, rejected) | same as Track G (only France changes) | 0.985031 |
 | + round-2 bagging, 3 samples (Track H) | 0.98962 (US 0.98991, India 0.98918) | 0.985252 |
 | + France density correction, logit shift 0.5 | 0.98962 (France unlabeled) | 0.985374 |
-| + round 3, collective stacking (**final**) | **0.98966** (US 0.98995, India 0.98923) | **0.985487** |
+| + round 3, collective stacking | 0.98966 (US 0.98995, India 0.98923) | 0.985487 |
+| + round-3 bagging, 3 samples (**final**) | **0.98971** (US 0.98999, India 0.98928) | **0.98553** |
 
-- **F_0.5 score (macro): 0.98966** on train out-of-fold (all 2.21M train S1, 4 entity-grouped folds; US 0.98995,
-  India 0.98923); **public leaderboard 0.985487**. The best achievable score from the candidates is 0.99671.
-- Final model: precision 0.9985, recall 0.9709. Singleton F0.5 0.9942, other entities 0.9894.
+- **F_0.5 score (macro): 0.98971** on train out-of-fold (all 2.21M train S1, 4 entity-grouped folds; US 0.98999,
+  India 0.98928); **public leaderboard 0.98553**. The best achievable score from the candidates is 0.99671.
+- Final model: precision 0.9985, recall 0.9711. Singleton F0.5 0.9942, other entities 0.9894.
 - **Per country on the leaderboard:** four diagnostic submissions blanked or invalidated one country's rows.
   Their exact scores are consistent with India/US scoring as out-of-fold, and with **France ≈ 0.960**: about 40%
   of the leaderboard loss from 15% of the entities. Track G raised France to about 0.9606. Track F changed only
   France (India/US byte-identical), so its −0.000135 against Track G is the exact effect of its France
   adaptations.
-- **Common false negatives (2.91% of true pairs):**
+- **Common false negatives (2.89% of true pairs):**
   - most are records without an address whose name is shared by several S1s: owned by the wrong S1 (1.00% of
-    true pairs, 90% without an address), never a candidate (1.09%, 59%), or below threshold (0.80%, 62%);
+    true pairs, 90% without an address), never a candidate (1.09%, 59%), or below threshold (0.79%, 62%);
   - otherwise heavy combined name and address corruption.
 - **Common false positives (0.15% of predictions):**
   - look-alike distractors with the same name and a nearby or the same street (61%);
@@ -199,20 +201,20 @@ probabilities.
 - `src/ber/`: package with `io`, `normalize`, `mining`, `blocking`, `features`, `models`, `decision`, `eval` and
   `pipeline`.
 - `configs/config.yaml`: every setting of the final submission.
-- `scripts/`: quick sample check (`smoke_test.sh`), sample builder and scorer, packaging.
-- `README.md` (machine, setup, commands, runtime, outputs), `requirements.txt` (pinned), `environment.yml`.
+- `README.md` (machine, setup, commands, runtime, outputs) and `requirements.txt` (pinned versions).
 
 **Entry points:**
 - **Train + predict:** from `code/business_entity_resolution/`, with `PYTHONPATH=src` and the data in
   `../../dataset/{train,test}`: `python -m ber.pipeline.run --config configs/config.yaml --stage all`. It writes
-  `../../output/matching_results.tsv` and `candidate_pairs.tsv` and runs the official validator. About 12.5 h on
+  `../../output/matching_results.tsv` and `candidate_pairs.tsv` and runs the official validator. About 13.5 h on
   4 CPU cores + 2× T4; every stage resumes after an interruption.
 - **Inference on new test data** with the trained models (`neural_nexus_models.tar.gz` extracted into `work/`):
   `python -m ber.pipeline.run --config configs/config.yaml --set run.inference_only=true --stage all`.
 - Verified on sample data:
   - inference-only from the models bundle reproduces the full run byte for byte;
-  - the checkpointed Kaggle runs that produced the submission (full → A → G → H) reproduce one from-scratch run of
-    the same settings byte for byte.
+  - the checkpointed Kaggle runs full → A → G → H reproduce one from-scratch run of the same settings byte for byte;
+    the later steps (I: round 3, J: round-3 bagging) add the stages `r3` / `r3bag`, verified end to end on sample
+    data (re-runs and inference-only reproduce their outputs exactly).
 
 ### B. Additional Results
 - **Decision layer:** exact expected-F0.5 rule vs grid rule = +0.00001 (tie). A 2-hop expansion gained +0.00013
@@ -223,6 +225,8 @@ probabilities.
   - macro F0.5 +0.00003.
 - **Round 3:** pair AUC 0.999660 → 0.999661, AP 0.999347 → 0.999348 (one model matches the 3-model round-2
   average); macro F0.5 +0.00004 on train out-of-fold; leaderboard +0.000113 (France included).
+- **Round-3 bagging (3 samples of 700k entities):** pair AUC 0.999661 → 0.999667, AP 0.999348 → 0.999359; gate
+  Brier 0.001910 → 0.001884; macro F0.5 +0.00005 on train out-of-fold; leaderboard +0.000043.
 - **Tried and rejected (measured):** letting an S1 that would be predicted empty also take its best record owned by
   a competing S1 (+0.000009 on train out-of-fold: those records are right only about half the time); a density
   correction for India/US (ln of their test/train list ratio, 0.12 / −0.02: no leaderboard change).

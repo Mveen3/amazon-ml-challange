@@ -1,13 +1,13 @@
 # Business Entity Resolution — Amazon ML Challenge 2026 (team neural_nexus)
 
 This pipeline links noisy Source 2 / Source 3 business records to Source 1 entities, optimised for per-entity
-**macro F0.5**. Final submission: **public leaderboard 0.985487**, train out-of-fold macro F0.5 0.98966.
+**macro F0.5**. Final submission: **public leaderboard 0.98553**, train out-of-fold macro F0.5 0.98971.
 The methodology is described in `Documentation_template.md` at the top level of the submission zip.
 
 ```
 raw TSV ─► normalise ─► candidates: TF-IDF/random-projection kNN (GPU) + exact keys ─► pre-ranker floor ══► candidate_pairs.tsv
         ─► round-1 GBDT ─► cross-encoder (uncertain band) ─► round-2 GBDT × 3 bags (consensus + competing clusters)
-        ─► round-3 GBDT (the same cluster features rebuilt from round-2 scores)
+        ─► round-3 GBDT × 3 bags (the same cluster features rebuilt from round-2 scores)
         ─► one owner per record ─► entity gate ─► per-S1 set rule tuned on out-of-fold F0.5 ══► matching_results.tsv
 ```
 
@@ -28,7 +28,7 @@ All settings of the final submission are in one file, **`configs/config.yaml`**.
 | Network | Once, to download `intfloat/multilingual-e5-small` (MIT, 118M parameters) from Hugging Face. No token, credentials or other network access. |
 | Python | 3.12 |
 
-Without a GPU the pipeline still runs (kNN and XGBoost fall back to CPU), but blocking takes many hours; see §7.
+Without a GPU the pipeline still runs (kNN and XGBoost fall back to CPU), but blocking takes many hours; see §6.
 
 ### 1.2 Setup
 
@@ -47,7 +47,7 @@ next to them, and optionally the official validator:
 ```bash
 cd code/business_entity_resolution
 conda create -n ber python=3.12 -y && conda activate ber   # or any Python 3.12 environment (e.g. python3.12 -m venv)
-pip install -r requirements.txt                             # (conda alternative: conda env create -f environment.yml)
+pip install -r requirements.txt
 export PYTHONPATH=$PWD/src                                  # the package is src/ber (no install step)
 ```
 
@@ -61,7 +61,6 @@ python -m ber.pipeline.run --config configs/config.yaml --stage all
   validator (if present), then the error analysis.
 - **Resumable:** every stage writes a completion marker, and the long stages save finished pieces. After an
   interruption, run the same command again; finished work is skipped.
-- A quick end-to-end check on a small sample takes a few minutes (§2); worth doing first.
 
 ### 1.4 Outputs and reports
 
@@ -78,32 +77,18 @@ python -m ber.pipeline.run --config configs/config.yaml --stage all
 
 Measured on Kaggle (4 CPU cores, 2× T4, 30 GB RAM), in minutes:
 
-| normalise etc. | block | prerank + expand | features | r1 | cross-encoder | r2 | r2bag | r3 | gate, tune, predict, outputs, errors |
-|---|---|---|---|---|---|---|---|---|---|
-| ~25 (estimate) | 157 | 60 | 176 | 74 | 117 | 37 | 55 | 35 | 26 |
+| normalise etc. | block | prerank + expand | features | r1 | cross-encoder | r2 | r2bag | r3 | r3bag | gate, tune, predict, outputs, errors |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ~25 (estimate) | 157 | 60 | 176 | 74 | 117 | 37 | 55 | 35 | 46 | 25 |
 
-About 12.5 h in total. `features` and `normalize` are CPU-bound and shrink with more cores; `block` and the
+About 13.5 h in total. `features` and `normalize` are CPU-bound and shrink with more cores; `block` and the
 cross-encoder with a faster GPU.
 
 ---
 
-## 2. Quick check on a sample (a few minutes)
+## 2. Inference only, with the trained models
 
-```bash
-bash scripts/smoke_test.sh          # CE=0 bash scripts/smoke_test.sh  skips the cross-encoder (no model download)
-```
-
-It builds `sample_data/` from the training data once (3k train S1 + 2k pseudo-test S1, where about 30% of the US
-clusters are relabelled "France" to exercise the path for a country without labels), runs every stage of
-`configs/config.yaml` with sample-size overrides into `work_smoke/` and `output_smoke/`, validates the outputs and
-scores them against the sample truth. Sample scores are far higher than real ones (sample distractors are random),
-so it proves the pipeline runs, not its accuracy.
-
----
-
-## 3. Inference only, with the trained models
-
-The trained models (`neural_nexus_models.tar.gz`, 814 MB: mined tables, all GBDT fold models, the cross-encoder,
+The trained models (`neural_nexus_models.tar.gz`: mined tables, all GBDT fold models, the cross-encoder,
 calibrators, floors and thresholds) are available on request.
 
 ```bash
@@ -116,7 +101,7 @@ byte.
 
 ---
 
-## 4. Stage by stage
+## 3. Stage by stage
 
 ```bash
 R="python -m ber.pipeline.run --config configs/config.yaml"
@@ -127,7 +112,7 @@ $R --stage features                         # round-1 pair features (sharded, al
 $R --stage r1                               # round-1 GBDT, out-of-fold on train
 $R --stage ce_train,ce_infer                # cross-encoder: two cross-fitted halves, uncertain band only
 $R --stage r2,r2bag                         # round 2 (+ 2 more bags on other entity samples, averaged)
-$R --stage r3                               # round 3: cluster features from round-2 scores, third pair model
+$R --stage r3,r3bag                         # round 3: cluster features from round-2 scores (+ 2 more bags, averaged)
 $R --stage gate,tune,predict,outputs        # entity gate, thresholds, submission files + validator
 $R --stage errors                           # train out-of-fold error analysis
 ```
@@ -140,19 +125,13 @@ $R --stage errors                           # train out-of-fold error analysis
 
 ---
 
-## 5. Layout
+## 4. Layout
 
 ```
 code/business_entity_resolution/
 ├── README.md
 ├── requirements.txt             pinned pip environment
-├── environment.yml              the same as a conda environment ("ber")
 ├── configs/config.yaml          all settings of the final submission
-├── scripts/
-│   ├── smoke_test.sh            quick end-to-end check on a sample
-│   ├── make_sample.py           builds sample_data/ from the training data
-│   ├── score_sample.py          scores sample outputs against the sample truth
-│   └── package_submission.sh    builds <team>_submission.zip (+ optional models bundle)
 └── src/ber/
     ├── io.py                    TSV → Parquet, unified id space, output writers
     ├── normalize/               text cleanup, Indic romaniser, consonant skeletons, country profiles, parsers
@@ -176,7 +155,7 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 
 ---
 
-## 6. Configuration (`configs/config.yaml`)
+## 5. Configuration (`configs/config.yaml`)
 
 | Setting | Final value | Meaning |
 |---|---|---|
@@ -191,7 +170,7 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 | `decision.grid`, `decision.expected` | | search space of the per-country set rules |
 | `decision.overrides.france` | κ 1.2 | France's set rule (no labels; see the documentation) |
 | `decision.logit_shift` | France 0.5 | test-time density correction of France's probabilities (France lists are 2× denser than train) |
-| `r3.enabled` | true | round 3 (round-2 features rebuilt from round-2 scores + a third pair model) |
+| `r3.enabled`, `r3.bags` | true, 3 | round 3 (round-2 features rebuilt from round-2 scores + a third pair model), 3 bags averaged |
 | `*.gbdt` | XGBoost, 4 folds | backend (`xgboost` / `lightgbm`), device (`auto` / `cpu` / `cuda`), rounds, parameters |
 | `run.max_gpus` | 0 | 0 = use all GPUs; 1 = single-GPU behaviour everywhere |
 | `run.n_workers` | -1 | CPU workers (-1 = all cores) |
@@ -199,7 +178,7 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 
 ---
 
-## 7. Hardware notes
+## 6. Hardware notes
 
 - **GPUs:** the kNN search copies the index to every GPU and shares out query chunks (exact top-k, identical to a
   single-GPU result); XGBoost fold models train concurrently, one per GPU; the two cross-encoder halves run as one
@@ -212,7 +191,7 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 
 ---
 
-## 8. Reproducibility, fair play and licences
+## 7. Reproducibility, fair play and licences
 
 - **Deterministic:** seeded RNGs; every model input and ranking sorted by `(s1_uid, rec_uid)` with explicit
   tie-breaks; cuBLAS pinned with `CUBLAS_WORKSPACE_CONFIG`. Two from-scratch sample runs give byte-identical
@@ -226,7 +205,7 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 
 ---
 
-## 9. How the submitted files were produced
+## 8. How the submitted files were produced
 
 The submitted files were computed on Kaggle (2× T4, 12 h sessions) in checkpointed steps: each step restored the
 finished stages of the previous ones and re-did the rest. `configs/config.yaml` merges the settings of the final
@@ -240,17 +219,19 @@ chain into one from-scratch run.
 | F | France admin level also ignored in round-1 features, France list sizes rescaled | same as G | 0.985031 (rejected) |
 | H | round-2 bagging (3 samples), on top of G | 0.98962 | 0.985252 |
 | H + France shift | France test probabilities shifted by 0.5 logits (`decision.logit_shift`) | 0.98962 | 0.985374 |
-| **I** | **round 3: round-2 cluster features rebuilt from round-2 scores + a third pair model** | **0.98966** | **0.985487 (final)** |
+| I | round 3: round-2 cluster features rebuilt from round-2 scores + a third pair model | 0.98966 | 0.985487 |
+| **J** | **round-3 bagging (3 samples), on top of I** | **0.98971** | **0.98553 (final)** |
 
-On sample data, this chain and one from-scratch run of the same settings give byte-identical outputs. On the full
+On sample data, the chain up to H and one from-scratch run of the same settings give byte-identical outputs; the
+round-3 stages of I and J were verified end to end on sample data. On the full
 data, the one difference is that the chain reused the cross-encoder scores of the full run, whose score band came
 from its 500k-entity round 1. The Kaggle driver notebook is not part of this package (it only called this pipeline).
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
-- **Out of memory:** see §7 "Less RAM". Changing `prerank.chunk_rows` or `features.shard_rows` discards that stage's
+- **Out of memory:** see §6 "Less RAM". Changing `prerank.chunk_rows` or `features.shard_rows` discards that stage's
   saved partial progress (they are part of its resume plan).
 - **Slow blocking:** check that the log shows `knn: ... on cuda`; `blocking.knn.mem_gb` sets the GPU memory used per
   query chunk.
