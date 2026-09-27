@@ -1,12 +1,13 @@
 # Business Entity Resolution — Amazon ML Challenge 2026 (team neural_nexus)
 
 This pipeline links noisy Source 2 / Source 3 business records to Source 1 entities, optimised for per-entity
-**macro F0.5**. Final submission: **public leaderboard 0.985252**, train out-of-fold macro F0.5 0.98962.
+**macro F0.5**. Final submission: **public leaderboard 0.985487**, train out-of-fold macro F0.5 0.98966.
 The methodology is described in `Documentation_template.md` at the top level of the submission zip.
 
 ```
 raw TSV ─► normalise ─► candidates: TF-IDF/random-projection kNN (GPU) + exact keys ─► pre-ranker floor ══► candidate_pairs.tsv
         ─► round-1 GBDT ─► cross-encoder (uncertain band) ─► round-2 GBDT × 3 bags (consensus + competing clusters)
+        ─► round-3 GBDT (the same cluster features rebuilt from round-2 scores)
         ─► one owner per record ─► entity gate ─► per-S1 set rule tuned on out-of-fold F0.5 ══► matching_results.tsv
 ```
 
@@ -77,11 +78,11 @@ python -m ber.pipeline.run --config configs/config.yaml --stage all
 
 Measured on Kaggle (4 CPU cores, 2× T4, 30 GB RAM), in minutes:
 
-| normalise etc. | block | prerank + expand | features | r1 | cross-encoder | r2 | r2bag | gate, tune, predict, outputs, errors |
-|---|---|---|---|---|---|---|---|---|
-| ~25 (estimate) | 157 | 60 | 176 | 74 | 117 | 37 | 55 | 26 |
+| normalise etc. | block | prerank + expand | features | r1 | cross-encoder | r2 | r2bag | r3 | gate, tune, predict, outputs, errors |
+|---|---|---|---|---|---|---|---|---|---|
+| ~25 (estimate) | 157 | 60 | 176 | 74 | 117 | 37 | 55 | 35 | 26 |
 
-About 12 h in total. `features` and `normalize` are CPU-bound and shrink with more cores; `block` and the
+About 12.5 h in total. `features` and `normalize` are CPU-bound and shrink with more cores; `block` and the
 cross-encoder with a faster GPU.
 
 ---
@@ -126,6 +127,7 @@ $R --stage features                         # round-1 pair features (sharded, al
 $R --stage r1                               # round-1 GBDT, out-of-fold on train
 $R --stage ce_train,ce_infer                # cross-encoder: two cross-fitted halves, uncertain band only
 $R --stage r2,r2bag                         # round 2 (+ 2 more bags on other entity samples, averaged)
+$R --stage r3                               # round 3: cluster features from round-2 scores, third pair model
 $R --stage gate,tune,predict,outputs        # entity gate, thresholds, submission files + validator
 $R --stage errors                           # train out-of-fold error analysis
 ```
@@ -188,6 +190,8 @@ out-of-fold). Peak RAM depends on the training sample, not on the total number o
 | `features.admin_strip` | on, `pairs: false` | address admin level of countries without labels, ignored in round-2 consensus only |
 | `decision.grid`, `decision.expected` | | search space of the per-country set rules |
 | `decision.overrides.france` | κ 1.2 | France's set rule (no labels; see the documentation) |
+| `decision.logit_shift` | France 0.5 | test-time density correction of France's probabilities (France lists are 2× denser than train) |
+| `r3.enabled` | true | round 3 (round-2 features rebuilt from round-2 scores + a third pair model) |
 | `*.gbdt` | XGBoost, 4 folds | backend (`xgboost` / `lightgbm`), device (`auto` / `cpu` / `cuda`), rounds, parameters |
 | `run.max_gpus` | 0 | 0 = use all GPUs; 1 = single-GPU behaviour everywhere |
 | `run.n_workers` | -1 | CPU workers (-1 = all cores) |
@@ -234,7 +238,9 @@ chain into one from-scratch run.
 | A | round 1 re-trained on 800k entities | 0.98952 | — |
 | G | round 2 with competing-cluster features, 700k entities | 0.98959 | 0.985166 |
 | F | France admin level also ignored in round-1 features, France list sizes rescaled | same as G | 0.985031 (rejected) |
-| **H** | **round-2 bagging (3 samples), on top of G** | **0.98962** | **0.985252 (final)** |
+| H | round-2 bagging (3 samples), on top of G | 0.98962 | 0.985252 |
+| H + France shift | France test probabilities shifted by 0.5 logits (`decision.logit_shift`) | 0.98962 | 0.985374 |
+| **I** | **round 3: round-2 cluster features rebuilt from round-2 scores + a third pair model** | **0.98966** | **0.985487 (final)** |
 
 On sample data, this chain and one from-scratch run of the same settings give byte-identical outputs. On the full
 data, the one difference is that the chain reused the cross-encoder scores of the full run, whose score band came

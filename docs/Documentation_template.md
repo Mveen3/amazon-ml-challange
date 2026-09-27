@@ -10,8 +10,9 @@
 We resolve each Source-1 (S1) business to its Source-2/3 records in four steps:
 1. multi-channel blocking (character TF-IDF nearest neighbours on GPU, plus exact keys);
 2. a gradient-boosted pre-ranker that trims candidates without losing recall;
-3. two rounds of gradient-boosted pair classification around a small multilingual cross-encoder (round 2 bagged
-   over three entity samples), with an entity-level "has a match" gate;
+3. three rounds of gradient-boosted pair classification around a small multilingual cross-encoder: round 2 bagged
+   over three entity samples, round 3 re-reading each S1's cluster from round 2's scores; plus an entity-level
+   "has a match" gate;
 4. a per-entity set decision that directly targets macro F0.5.
 
 Beyond a standard pipeline, the key ideas are:
@@ -66,6 +67,15 @@ metric-optimal set decision (hybrid, collective).
    (India/US identical) and rejected: −0.000135.
 4. Round-2 bagging: three round-2 models on different 700k-entity samples, averaged and recalibrated. Together
    they learn from far more of the 2.2M training entities than one model fits in 30 GB of RAM.
+5. Density correction for the unlabeled country: France's candidate lists are 1.98× as long as in training (more
+   look-alike distractors per S1), so probabilities calibrated on training are too high there. France's test pair
+   and gate probabilities are shifted down by 0.5 on the logit scale. Tuned with France-only submissions: s = −0.5 /
+   0 / 0.5 / 1.0 → France F0.5 −0.0016 / 0 / **+0.0008** / +0.00075; the density ratio itself predicts
+   ln 1.98 = 0.68, inside the optimum.
+6. Round 3 (collective stacking): round 2's cluster features (score context, consensus with confident members,
+   competing clusters) are recomputed from round 2's own out-of-fold scores instead of round 1's, and a third pair
+   model is trained on them. Each record is judged against a more accurate picture of its S1's cluster and of the
+   competing same-name S1s.
 
 ## 3. Candidate Generation (Blocking)
 
@@ -121,7 +131,9 @@ metric-optimal set decision (hybrid, collective).
 - XGBoost (GPU, 4 entity-grouped folds, out-of-fold predictions) for the pre-ranker, round 1 (800k training
   entities), round 2 and the entity gate (P(has ≥ 1 match)).
 - Round 2 is bagged: three fold sets, each trained on a different 700k-entity sample (seeds 142, 1142, 2142).
-  Their scores are averaged, and the average is recalibrated. The gate and thresholds are trained on the average.
+  Their scores are averaged and recalibrated.
+- Round 3: one XGBoost fold set (700k entities, seed 342) on the round-2 features rebuilt from the bagged round-2
+  scores, plus the round-1 score. Its calibrated scores are final; the gate and thresholds are trained on them.
 - Isotonic calibration per country; France uses the US calibration.
 
 **Threshold selection method:** a per-entity set rule tuned on train out-of-fold macro F0.5, per country:
@@ -130,9 +142,10 @@ metric-optimal set decision (hybrid, collective).
 - each record goes to its best S1 only.
 
 Final values:
-- India: κ = 1.0.
-- US: κ = 1.0, t_min = 0.3.
-- France (no labels): pinned to κ = 1.2, t_min = 0, δ = 0, the rule behind its measured leaderboard score. The
+- India: κ = 0.8.
+- US: κ = 0.9.
+- France (no labels): its test probabilities are first shifted by −0.5 logits (density correction, §2.2), then
+  pinned to κ = 1.2, t_min = 0, δ = 0, the rule behind its measured leaderboard score. The
   US optimum it would otherwise inherit is flat in κ and moved between 0.8 and 1.2 across runs.
 
 An exact expected-F0.5 subset rule (a dynamic program over the member probabilities) is searched alongside. It
@@ -147,27 +160,29 @@ probabilities.
 | + 800k entities (Track A) | 0.98952 (US 0.98982, India 0.98907) | — |
 | + competing-cluster features, round 2 on 700k (Track G) | 0.98959 (US 0.98988, India 0.98914) | 0.985166 |
 | + France round-1 adaptations (Track F, rejected) | same as Track G (only France changes) | 0.985031 |
-| + round-2 bagging, 3 samples (Track H, **final**) | **0.98962** (US 0.98991, India 0.98918) | **0.985252** |
+| + round-2 bagging, 3 samples (Track H) | 0.98962 (US 0.98991, India 0.98918) | 0.985252 |
+| + France density correction, logit shift 0.5 | 0.98962 (France unlabeled) | 0.985374 |
+| + round 3, collective stacking (**final**) | **0.98966** (US 0.98995, India 0.98923) | **0.985487** |
 
-- **F_0.5 score (macro): 0.98962** on train out-of-fold (all 2.21M train S1, 4 entity-grouped folds; US 0.98991,
-  India 0.98918); **public leaderboard 0.985252**. The best achievable score from the candidates is 0.99671.
-- Final model: precision 0.9985, recall 0.9708. Singleton F0.5 0.9937, other entities 0.9894.
+- **F_0.5 score (macro): 0.98966** on train out-of-fold (all 2.21M train S1, 4 entity-grouped folds; US 0.98995,
+  India 0.98923); **public leaderboard 0.985487**. The best achievable score from the candidates is 0.99671.
+- Final model: precision 0.9985, recall 0.9709. Singleton F0.5 0.9942, other entities 0.9894.
 - **Per country on the leaderboard:** four diagnostic submissions blanked or invalidated one country's rows.
   Their exact scores are consistent with India/US scoring as out-of-fold, and with **France ≈ 0.960**: about 40%
   of the leaderboard loss from 15% of the entities. Track G raised France to about 0.9606. Track F changed only
   France (India/US byte-identical), so its −0.000135 against Track G is the exact effect of its France
   adaptations.
-- **Common false negatives (2.92% of true pairs):**
+- **Common false negatives (2.91% of true pairs):**
   - most are records without an address whose name is shared by several S1s: owned by the wrong S1 (1.00% of
-    true pairs, 90% without an address), never a candidate (1.09%, 59%), or below threshold (0.82%, 63%);
+    true pairs, 90% without an address), never a candidate (1.09%, 59%), or below threshold (0.80%, 62%);
   - otherwise heavy combined name and address corruption.
 - **Common false positives (0.15% of predictions):**
-  - look-alike distractors with the same name and a nearby or the same street (62%);
-  - records of another S1 sharing the name (31%);
+  - look-alike distractors with the same name and a nearby or the same street (61%);
+  - records of another S1 sharing the name (32%);
   - singletons given a match (7%).
 
 ## 6. Conclusion
-- Recall-first blocking plus two rounds of out-of-fold GBDT with competition features gets within 0.007 of the
+- Recall-first blocking plus three rounds of out-of-fold GBDT with competition features gets within 0.007 of the
   candidate ceiling.
 - The remaining train error is dominated by genuinely ambiguous missing-address records, which cluster-level
   (collective) features address.
@@ -190,7 +205,7 @@ probabilities.
 **Entry points:**
 - **Train + predict:** from `code/business_entity_resolution/`, with `PYTHONPATH=src` and the data in
   `../../dataset/{train,test}`: `python -m ber.pipeline.run --config configs/config.yaml --stage all`. It writes
-  `../../output/matching_results.tsv` and `candidate_pairs.tsv` and runs the official validator. About 12 h on
+  `../../output/matching_results.tsv` and `candidate_pairs.tsv` and runs the official validator. About 12.5 h on
   4 CPU cores + 2× T4; every stage resumes after an interruption.
 - **Inference on new test data** with the trained models (`neural_nexus_models.tar.gz` extracted into `work/`):
   `python -m ber.pipeline.run --config configs/config.yaml --set run.inference_only=true --stage all`.
@@ -206,6 +221,11 @@ probabilities.
   - pair AUC 0.999653 → 0.999660, AP 0.999333 → 0.999347;
   - gate Brier 0.001885 → 0.001870;
   - macro F0.5 +0.00003.
+- **Round 3:** pair AUC 0.999660 → 0.999661, AP 0.999347 → 0.999348 (one model matches the 3-model round-2
+  average); macro F0.5 +0.00004 on train out-of-fold; leaderboard +0.000113 (France included).
+- **Tried and rejected (measured):** letting an S1 that would be predicted empty also take its best record owned by
+  a competing S1 (+0.000009 on train out-of-fold: those records are right only about half the time); a density
+  correction for India/US (ln of their test/train list ratio, 0.12 / −0.02: no leaderboard change).
 - **France admin level detected in the test data:** 3 regions (Hauts-de-France, Nouvelle-Aquitaine, Pays de la
   Loire) and 4 departments (Gironde, Loire-Atlantique, Nord, Pas-de-Calais).
 - **Fair play:**

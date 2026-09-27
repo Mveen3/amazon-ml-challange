@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 ORDER = ["ingest", "eda", "mine", "normalize", "dense", "block", "prerank", "expand", "features", "r1",
-         "ce_train", "ce_infer", "r2", "r2bag", "r3", "gate", "tune", "predict", "outputs"]
+         "ce_train", "ce_infer", "r2", "r2bag", "r3", "r3bag", "gate", "tune", "predict", "outputs"]
 TRAIN_ONLY = {"eda", "mine", "ce_train", "tune"}
 
 # Rough full-scale minutes on Kaggle (4 slow CPU cores, 2x T4); only the ratios matter. Recalibrated on 26 Sep from a
@@ -28,7 +28,7 @@ TRAIN_ONLY = {"eda", "mine", "ce_train", "tune"}
 # (24M records), features ~55 min (~16M pairs at ~0.7 ms/pair/core), block and prerank dominated by 100M+-pair GPU
 # kNN and rapidfuzz scoring, XGBoost stages ~30-40 min each.
 MINUTES = {"ingest": 3, "eda": 1, "mine": 8, "normalize": 17, "dense": 30, "block": 65, "prerank": 70, "expand": 15,
-           "features": 55, "r1": 24, "ce_train": 24, "ce_infer": 36, "r2": 32, "r2bag": 50, "r3": 45, "gate": 4, "tune": 10, "predict": 3,
+           "features": 55, "r1": 24, "ce_train": 24, "ce_infer": 36, "r2": 32, "r2bag": 50, "r3": 45, "r3bag": 50, "gate": 4, "tune": 10, "predict": 3,
            "outputs": 8}  # block/GBDT/CE assume both GPUs are used (search shared, fold models and CE halves in parallel)
 
 

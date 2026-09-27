@@ -128,37 +128,48 @@ def run_r2bag(cfg) -> None:
 
     ``preds/r2.parquet`` is rewritten with the averaged ``p2`` / ``q``; the round-2 model's own score is kept as
     ``p2_b0``, so a re-run averages the same inputs again."""
-    n = int(cfg.r2.get("bags", 1))
-    if n <= 1:
-        log().info("  r2.bags = %d: no extra round-2 models", n)
+    _run_bags(cfg, "r2")
+
+
+def run_r3bag(cfg) -> None:
+    """Round-3 bagging, as ``run_r2bag``: ``r3.bags - 1`` more round-3 fold sets on other entity samples, averaged
+    with round 3's scores (kept as ``p2_r3b0``) and recalibrated."""
+    _run_bags(cfg, "r3")
+
+
+def _run_bags(cfg, stage: str) -> None:
+    n = int(cfg[stage].get("bags", 1))
+    if n <= 1 or (stage == "r3" and not (cfg.get("r3") or {}).get("enabled", False)):
+        log().info("  %s.bags = %d: no extra %s models", stage, n, stage)
         return
     from ..checkpoint import sync_now
 
+    base, off = ("p2_b", 100) if stage == "r2" else ("p2_r3b", 300)
     splits = ("test",) if inference_only(cfg) else ("train", "test")
     for k in range(1, n):
-        mdir = ensure_dir(work_dir(cfg, None, "models", f"r2_bag{k}"))
-        out = work_dir(cfg, "train", "preds", f"r2_bag{k}.parquet")
+        mdir = ensure_dir(work_dir(cfg, None, "models", f"{stage}_bag{k}"))
+        out = work_dir(cfg, "train", "preds", f"{stage}_bag{k}.parquet")
         if not inference_only(cfg) and not (out.exists() and (mdir / "trained.json").exists()):
-            seed = int(cfg.run.seed) + 100 + 1000 * k
-            pr = _fit_r2(cfg, mdir, seed, tag=f"r2 bag {k}")
+            seed = int(cfg.run.seed) + off + 1000 * k
+            pr = _fit_r2(cfg, mdir, seed, tag=f"{stage} bag {k}", stage=stage)
             pr.select(KEYS + [pl.col("pred").alias("p2")]).write_parquet(out)
             del pr
             gc.collect()
             save_json({"seed": seed}, mdir / "trained.json")
-            sync_now(f"round-2 bag {k} trained")  # a new session resumes with the next bag
-        te = work_dir(cfg, "test", "preds", f"r2_bag{k}.parquet")
+            sync_now(f"{stage} bag {k} trained")  # a new session resumes with the next bag
+        te = work_dir(cfg, "test", "preds", f"{stage}_bag{k}.parquet")
         if not te.exists():
-            extras = pl.read_parquet(work_dir(cfg, "test", "feats", "r2_extras.parquet"))
+            extras = pl.read_parquet(work_dir(cfg, "test", "feats", f"{stage}_extras.parquet"))
             score_r2(cfg, "test", extras, load_folds(mdir)).select(KEYS + [pl.col("pred").alias("p2")]).write_parquet(te)
-    cal_path = work_dir(cfg, None, "models", "r2_bag_calibrator.pkl")
-    cols = [f"p2_b{k}" for k in range(n)]
+    cal_path = work_dir(cfg, None, "models", f"{stage}_bag_calibrator.pkl")
+    cols = [f"{base}{k}" for k in range(n)]
     for split in splits:
         path = work_dir(cfg, split, "preds", "r2.parquet")
         r2 = pl.read_parquet(path)
-        if "p2_b0" not in r2.columns:
-            r2 = r2.with_columns(pl.col("p2").alias("p2_b0"))
+        if cols[0] not in r2.columns:
+            r2 = r2.with_columns(pl.col("p2").alias(cols[0]))
         for k in range(1, n):
-            b = pl.read_parquet(work_dir(cfg, split, "preds", f"r2_bag{k}.parquet")).rename({"p2": f"p2_b{k}"})
+            b = pl.read_parquet(work_dir(cfg, split, "preds", f"{stage}_bag{k}.parquet")).rename({"p2": cols[k]})
             r2 = r2.join(b, on=KEYS, how="left")
         r2 = (r2.with_columns(pl.mean_horizontal([pl.col(c).fill_nan(None) for c in cols]).alias("p2"))
               .drop(cols[1:]).sort(KEYS))
@@ -166,11 +177,11 @@ def run_r2bag(cfg) -> None:
         if split == "train":
             y = r2["label"].to_numpy().astype(np.float32)
             Calibrator(fallback=cfg.decision.fallback_profile).fit(p, y, prof).save(cal_path)
-            save_json({"bags": n, "single": _auc(y, r2["p2_b0"].to_numpy(), "r2 (bag 0)"),
-                       "bagged": _auc(y, p, f"r2 ({n} bags)")},
-                      work_dir(cfg, None, "models", "r2_bag_metrics.json"))
+            save_json({"bags": n, "single": _auc(y, r2[cols[0]].to_numpy(), f"{stage} (bag 0)"),
+                       "bagged": _auc(y, p, f"{stage} ({n} bags)")},
+                      work_dir(cfg, None, "models", f"{stage}_bag_metrics.json"))
         r2.with_columns(pl.Series("q", Calibrator.load(cal_path).transform(p, prof))).write_parquet(path)
-        log().info("  %s: round-2 scores = mean of %d models", split, n)
+        log().info("  %s: %s scores = mean of %d models", split, stage, n)
 
 
 def r3_extras(cfg, split: str) -> pl.DataFrame:
