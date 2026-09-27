@@ -17,10 +17,8 @@ dependencies:
   - pip
   - pip:
       # PyPI wheels for the GPU stack (conda builds of transformers lag behind)
-      - torch==2.5.1
-      - transformers==4.46.3
-      - tokenizers==0.20.3
-      - huggingface-hub==0.26.5
-      - safetensors==0.4.5
+      - torch==2.10.0
+      - transformers==5.0.0
+      - huggingface-hub==1.11.0
       - sentencepiece==0.2.0
       - protobuf==5.28.3

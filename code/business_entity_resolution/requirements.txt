@@ -9,11 +9,11 @@ rapidfuzz==3.14.1
 lightgbm==4.7.0
 xgboost==3.3.0
 PyYAML==6.0.3
-# Neural stages (cross-encoder; optional bi-encoder). GPU wheels of torch 2.5.1 bundle CUDA 12.x.
-torch==2.5.1
-transformers==4.46.3
-tokenizers==0.20.3
-huggingface-hub==0.26.5
-safetensors==0.4.5
+# Neural stages (cross-encoder). These are the versions of the Kaggle runs that produced the final submission
+# (torch 2.10.0+cu128, transformers 5.0.0, huggingface_hub 1.11.0); the Linux torch wheels on PyPI bundle CUDA 12.x.
+# tokenizers / safetensors are left to transformers' own version constraints.
+torch==2.10.0
+transformers==5.0.0
+huggingface-hub==1.11.0
 sentencepiece==0.2.0
 protobuf==5.28.3

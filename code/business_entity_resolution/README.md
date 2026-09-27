@@ -6,7 +6,7 @@ The design, the data facts and the reasoning behind every choice are in [`docs/P
 
 ```
 raw TSV ─► 0 normalise ─► 1 candidates (TF-IDF/RP kNN + keys ─► pre-ranker floor ─► 2-hop) ══► candidate_pairs.tsv
-        ─► 2 round-1 LightGBM ─► cross-encoder (uncertain band) ─► round-2 LightGBM (consensus + competition)
+        ─► 2 round-1 GBDT ─► cross-encoder (uncertain band) ─► round-2 GBDT ×3 bags (consensus + competition)
         ─► 3 one owner per record ─► entity gate ─► first-member rule + t_add(k) + caps ══► matching_results.tsv
 ```
 
@@ -14,46 +14,65 @@ raw TSV ─► 0 normalise ─► 1 candidates (TF-IDF/RP kNN + keys ─► pre-
 
 ## 0. Final submission: how to reproduce it (read this first)
 
-The final submission is produced by **`configs/final.yaml`**: the Kaggle profile (2× T4, 4 CPU, 30 GB RAM; a
-larger machine works unchanged) plus the final improvements, which are listed at the top of that file. The
-methodology write-up is `docs/Documentation_template.md`.
+The final submission (leaderboard 0.985252) is produced by **`configs/final.yaml`**. The methodology write-up is
+`Documentation_template.md` at the top of the submission zip.
 
-**From scratch (train + predict), from this folder, with the challenge data in `../../dataset/{train,test}`:**
+### 0.1 Machine (for example on AWS)
+
+- **One GPU instance** is enough, for example `g5.4xlarge` / `g6.4xlarge` (1 GPU with 24 GB, 16 vCPU, 64 GiB) or
+  `g4dn.12xlarge` (4× T4, 48 vCPU, 192 GiB). Every multi-GPU path detects the GPUs itself; one GPU works.
+- **RAM:** at least 32 GiB, 64 GiB recommended (measured peak 30.3 GB, in round 1 / round 2 training).
+- **Disk:** about 100 GB free for `work/`.
+- **Internet:** once, to download `intfloat/multilingual-e5-small` (MIT, 118M parameters) from Hugging Face. No
+  token, AWS service or other network access is used.
+- **Runtime:** about 12 h on Kaggle's 4 CPU + 2× T4. A 16-vCPU instance is faster on the CPU-heavy stages.
+
+### 0.2 Commands
+
+The zip's top level holds `output/`, `code/` and `Documentation_template.md`. Put the challenge data next to
+them, in `dataset/train/` and `dataset/test/`; the official validator, if present in `utils/validate_submission.py`,
+runs automatically at the end.
+
 ```bash
-pip install -r requirements.txt            # or requirements-kaggle.txt on a Kaggle image
+conda create -n ber python=3.12 -y && conda activate ber     # any Python 3.12 environment works
+cd code/business_entity_resolution
+pip install -r requirements.txt
+export PYTHONPATH=$PWD/src                                    # the package lives in src/ber (no install step)
+
 python -m ber.pipeline.run --config configs/final.yaml --stage all
 ```
-- It writes `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv` and runs the official
-  validator on them.
-- Runtime on Kaggle 2× T4 is about 11 h. Every stage resumes after an interruption (see §4.3.1).
 
-**Inference only on new test data, with our trained models:**
+- It writes `../../output/matching_results.tsv` and `../../output/candidate_pairs.tsv` (the zip's `output/`).
+- Every stage resumes after an interruption: run the same command again.
+- The run needs no credentials. Hugging Face checkpointing (`checkpoint.enabled`) is only for Kaggle sessions and
+  switches itself off without an `HF_TOKEN`.
+- **Quick check first (about 5 minutes):** see §3. `configs/smoke.yaml` runs every stage on a small sample, on CPU.
+
+**Inference only on new test data, with our trained models** (`neural_nexus_models.tar.gz`, 814 MB, available on
+request):
 ```bash
-mkdir -p work && tar xzf <team>_models.tar.gz -C work     # tables.pkl + models/ (incl. density_ref.json)
+mkdir -p work && tar xzf neural_nexus_models.tar.gz -C work   # tables.pkl + models/ (incl. density_ref.json)
 python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all
 ```
 This processes only `../../dataset/test/` and loads every model, calibrator, floor and threshold. Verified on
 sample data: it reproduces the full run's outputs byte for byte.
 
-**How the final files were computed on Kaggle (checkpointed tracks; same result as one from-scratch run):**
+### 0.3 How the final files were computed on Kaggle
+
+The submitted files come from checkpointed Kaggle runs ("tracks"). Each track restores the finished stages of the
+previous ones from Hugging Face and re-does the rest:
 1. `full` = `configs/kaggle.yaml`: the full pipeline run.
 2. `configs/track_a.yaml`: r1/r2 re-trained on 800k entities (starts from `r1`).
-3. `configs/track_g.yaml`: final round 2 with competing-cluster features and per-country list sizes (starts from
-   `r2`).
-4. `configs/track_f.yaml`: inference-only, test features recomputed with the France adaptations and re-scored with
-   the trained models (starts from `features`). Its outputs and models bundle are the final submission.
+3. `configs/track_g.yaml`: round 2 with competing-cluster features and per-country list sizes (starts from `r2`).
+   Leaderboard 0.985166.
+4. `configs/track_f.yaml`: France adaptations in the round-1 features (starts from `features`). Leaderboard
+   0.985031, i.e. −0.000135 against Track G with India/US identical: rejected.
+5. `configs/track_h.yaml`: round-2 bagging (starts from `r2bag`). Two more round-2 models on other 700k-entity
+   samples are averaged with Track G's. **Final submission, leaderboard 0.985252.**
 
-5. `configs/track_h.yaml`: round-2 bagging, i.e. two more round-2 models on other 700k-entity samples averaged with
-   Track G's (starts from `r2bag`). France keeps Track G's features and set rule: Track F's France adaptations cost
-   0.000135 on the leaderboard (0.985031 vs Track G's 0.985166, India/US identical).
-
-Tracks 3 and 4 run in one Kaggle session: notebook `CONFIG = "configs/track_g.yaml"`,
-`THEN_CONFIG = "configs/track_f.yaml"`. Track G's files end up in `/kaggle/working/track_g/`, Track F's at the top
-level.
-
-On sample data this chain gives a `matching_results.tsv` / `candidate_pairs.tsv` byte-identical to one
-from-scratch `final.yaml` run. On the full data the one difference is that the chain reuses the cross-encoder
-scores of the first run (their score band came from the 500k-entity round 1).
+`configs/final.yaml` holds all of these settings in one from-scratch run. On sample data the track chain and the
+from-scratch run give byte-identical outputs. On the full data the one difference is that the chain reuses the
+cross-encoder scores of the first run (their score band came from its 500k-entity round 1).
 
 ---
 
@@ -276,16 +295,18 @@ A single GPU box with enough RAM (for example `g6e.16xlarge`, 512 GiB) can run e
 
 ### 5.2 Commands
 
-From `code/business_entity_resolution/`, with the challenge data in `../../dataset/{train,test}`:
+The final submission uses `configs/final.yaml` (§0). `configs/default.yaml` is the larger development profile
+these machines were first sized for. From `code/business_entity_resolution/`, with the challenge data in
+`../../dataset/{train,test}` and `PYTHONPATH=$PWD/src`:
 
 ```bash
-python -m ber.pipeline.run --config configs/default.yaml --stage all
+python -m ber.pipeline.run --config configs/final.yaml --stage all
 ```
 
 The same run, stage by stage (useful for monitoring and for moving between boxes):
 
 ```bash
-R="python -m ber.pipeline.run --config configs/default.yaml"
+R="python -m ber.pipeline.run --config configs/final.yaml"
 $R --stage ingest,eda,mine,normalize        # CPU
 $R --stage dense                            # no-op unless blocking.dense.enabled (GPU)
 $R --stage block                            # GPU recommended (kNN); logs train union ceiling / pair recall
@@ -296,7 +317,7 @@ $R --stage ce_train                         # GPU: two cross-fitted halves
 $R --stage ce_infer --split train --shard 0/2   # GPU: shard across GPUs/boxes if you like
 $R --stage ce_infer --split train --shard 1/2
 $R --stage ce_infer --split test  --shard 0/1
-$R --stage r2,gate,tune,predict,outputs     # CPU: round 2, gate, thresholds, submission files
+$R --stage r2,r2bag,gate,tune,predict,outputs   # round 2 (+ bagging), gate, thresholds, submission files
 ```
 
 - **Moving work between boxes:** `aws s3 sync work/ s3://<bucket>/work/` on one box and the reverse on the other.
@@ -347,7 +368,7 @@ $R --stage predict,outputs --probe fr_loose  --set decision.overrides.france.del
   1. Restore `work/tables.pkl` and `work/models/` from the models bundle (`bash scripts/package_submission.sh <team> --with-models` creates it).
   2. Run:
      ```bash
-     python -m ber.pipeline.run --config configs/default.yaml --set run.inference_only=true --stage all
+     python -m ber.pipeline.run --config configs/final.yaml --set run.inference_only=true --stage all
      ```
   - This processes the test split only and loads every model, calibrator, floor and threshold.
   - It was verified to reproduce the full run's outputs byte for byte.
