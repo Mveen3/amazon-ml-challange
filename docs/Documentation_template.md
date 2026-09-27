@@ -143,7 +143,7 @@ probabilities.
 | + 800k entities (Track A) | 0.98952 (US 0.98982, India 0.98907) | — |
 | + competing-cluster features, round 2 on 700k (Track G) | 0.98959 (US 0.98988, India 0.98914) | 0.985166 |
 | + France round-1 adaptations (Track F, rejected) | same as Track G (only France changes) | 0.985031 |
-| + round-2 bagging, 3 samples (Track H, **final**) | **0.98962** (US 0.98991, India 0.98918) | final submission |
+| + round-2 bagging, 3 samples (Track H, **final**) | **0.98962** (US 0.98991, India 0.98918) | **0.985252** |
 
 - Final model: precision 0.9985, recall 0.9708. Singleton F0.5 0.9937, other entities 0.9894.
 - **Per country on the leaderboard:** four diagnostic submissions blanked or invalidated one country's rows.
