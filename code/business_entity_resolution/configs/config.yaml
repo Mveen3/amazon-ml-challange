@@ -161,6 +161,7 @@ r2:                              # round-2 pair model: round-1 score + cross-enc
 r3:                              # round 3 (stage r3): round-2 extras rebuilt from round-2 scores + a new pair model
   enabled: true                  # train out-of-fold 0.98962 -> 0.98966; leaderboard 0.985374 -> 0.985487
   sample_entities: 700000
+  bags: 1                        # >1: extra round-3 models on other entity samples, averaged (stage r3bag)
   max_train_rows: 8000000
   gbdt:
     <<: *gbdt
