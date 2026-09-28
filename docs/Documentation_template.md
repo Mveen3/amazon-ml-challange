@@ -54,7 +54,7 @@ Beyond a standard pipeline, the key ideas are:
 - Candidate lists are twice as long as in train (20.4 per S1 against 10.8).
 
 ### 2.2 Solution Strategy
-**Approach Type:** Blocking + pre-ranker + two-round GBDT classifier (+ cross-encoder feature) + entity gate +
+**Approach Type:** Blocking + pre-ranker + three-round GBDT pair classifier (+ cross-encoder feature) + entity gate +
 metric-optimal set decision (hybrid, collective).
 
 **Core Innovation:**
@@ -104,9 +104,9 @@ metric-optimal set decision (hybrid, collective).
   true train pairs**.
 - 59% of the remaining lost pairs are records without an address whose name is shared by several S1s.
 
-## 4. Matching Model
+## 4. Matching Model (Model Architecture and Feature Engineering)
 
-**Features used (about 150 in round 1, about 185 in round 2):**
+**Features used (about 150 in round 1, about 185 in rounds 2 and 3):**
 - **Name:** Jaro-Winkler, Levenshtein, token set/sort/partial ratios on core, normalized, romanized and
   consonant-skeleton views; IDF-weighted Jaccard; coverage both ways; legal-form agreement by family; DBA /
   alternative names; domain-name matches (concatenation, initials).
@@ -125,11 +125,13 @@ metric-optimal set decision (hybrid, collective).
   - **competing-cluster state**: members of this S1 and of the record's best competing S1 (overall and from the
     record's source, room under the source caps, empty or not), and the number of S1s claiming the record at
     almost the same score.
-- List-size counts are divided by the country median in round 2 and the gate.
+- **Round 3:** the same round-2 feature set (score context, consensus, competing-cluster state), recomputed from the
+  bagged round-2 out-of-fold scores instead of the round-1 scores, plus the round-1 score itself.
+- List-size counts are divided by the country median in rounds 2 and 3 and the gate.
 
 **Model type:**
 - XGBoost (GPU, 4 entity-grouped folds, out-of-fold predictions) for the pre-ranker, round 1 (800k training
-  entities), round 2 and the entity gate (P(has ≥ 1 match)).
+  entities), rounds 2 and 3 and the entity gate (P(has ≥ 1 match)).
 - Round 2 is bagged: three fold sets, each trained on a different 700k-entity sample (seeds 142, 1142, 2142).
   Their scores are averaged and recalibrated.
 - Round 3: XGBoost fold sets on the round-2 features rebuilt from the bagged round-2 scores, plus the round-1
